@@ -1,6 +1,6 @@
 ---
 title: Rust ↔ Lean 4 FFI ベンチマーク実現可能性 調査メモ
-last_updated: 2026-04-24
+last_updated: 2026-04-30
 tags:
   - ffi
   - benchmark
@@ -20,7 +20,7 @@ tags:
 1. **同じことをやる 2 つの OPEN PR が既に存在する**。PR #2 (`feat/rust-ffi-poc`) は POC 全体を、PR #3 (`perf/fast-process-attestations`) は Aeneas の O(N²) を 55–134× 高速化する fast path を、既に実装済み。ユーザー決定で**参考資料としてのみ**扱い、実装は独立に行う。
 2. **`compute_lmd_ghost_head` は Validator 数 N を引数に取らない**。シグネチャは `(start_root, blocks, attestations, min_score) → (H256, Vec (H256, U64))`。N ではなく B (blocks) と A (attestations) でスケールする。ユーザーの「N を振る」という計測計画は `state_transition` 側にのみ素直に適用できる (compute_lmd_ghost_head は B, A 軸で計測)。
 3. **生成された `Vec<T>` の実体は `List α` ベース**で push / index が O(n)。`state_transition` 内の `process_attestations` は O(A·N²) で N>2K から実測困難、N=1M で 2 日。**Option X 方式**: `stateTransitionFast` を手書きで組み、`process_slots` / `process_block_header` (Aeneas の線形部分) + handwritten `processBlockFast` (内部で Array ベースの `processAttestationsFast`) + state_root 照合、の全体を 1 FFI コールに畳む。これで N=1M もエントリポイント e2e で実測可能 (~10 s / call 外挿)。
-4. **Aeneas 出力には形式的同値性の証明は付随しない** (Funs.lean は `def` のみで `theorem` なし)。よって slow (Aeneas 版) / fast (手書き版) の選択は純粋に engineering 最適化の話で、検証保証とは独立。本タスクは **slow path ベンチを行わず fast e2e のみ計測**する。
+4. **Aeneas 出力には形式的同値性の証明は付随しない** (Funs/{Types,JustifiedSlots,ForkChoice,StateTransition}.lean は `def` のみで `theorem` なし)。よって slow (Aeneas 版) / fast (手書き版) の選択は純粋に engineering 最適化の話で、検証保証とは独立。本タスクは **slow path ベンチを行わず fast e2e のみ計測**する。
 5. **Lean v4.28.0-rc1 で `precompileModules := true` は避けるべき** (Issue #5509)。PR #2 は `.c.o.export` object を build.rs で動的に拾って static リンクする方式で、これを採用する。
 
 **推奨 (ユーザー 2026-04-24 回答反映)**: PR #2 / #3 は**参考資料として残す**が、実装は**独立した新規ブランチで再作成**する。2 エントリポイント (`state_transition.state_transition`, `fork_choice.compute_lmd_ghost_head`) を**それぞれ 1 FFI コールの e2e で露出** (= Option X) して計測する。slow path の並走は行わない。**入力値は Rust 側で構築し、ToLean trait 経由で `lean_object*` に marshal して FFI で渡す** (= Option II)。将来的な SSZ バイト列方式 (Option III) への移行は別途 GitHub issue で追跡する。本メモは実装計画ではなく**調査報告**であり、実装計画は別途承認を取る。
@@ -128,7 +128,7 @@ slow の per-(V²·A) 定数 ≈ 10 ns (二次性の証拠)、fast の per-(V·A
 
 ## 2. 2 エントリポイントの計算量と実行可能性の上限
 
-### 2.1 `state_transition.state_transition` (Funs.lean:2693-2725)
+### 2.1 `state_transition.state_transition` (`Funs/StateTransition.lean:1356`)
 
 ```
 state_transition (state, block)
@@ -151,7 +151,7 @@ state_transition (state, block)
 - `process_slots`: O(S) (slots 数)
 - **全体**: O(A·N²) が支配。fast path 適用で **O(A·N)**
 
-### 2.2 `fork_choice.compute_lmd_ghost_head` (Funs.lean:1104-1154)
+### 2.2 `fork_choice.compute_lmd_ghost_head` (`Funs/ForkChoice.lean:991`)
 
 シグネチャ:
 ```lean
@@ -313,14 +313,14 @@ stateTransitionFast : State → Block → Result (Result Unit Error × State)
 └── hash_tree_root_state 照合
 ```
 
-`compute_lmd_ghost_head` は手書きせず、Aeneas 出力 (`Funs.lean` の定義) をそのまま `@[export]` 経由で呼ぶ。
+`compute_lmd_ghost_head` は手書きせず、Aeneas 出力 (`Funs/ForkChoice.lean:991` の定義) をそのまま `@[export]` 経由で呼ぶ。
 
 **骨子** (本メモ承認後、別途「実装計画」として再承認を取る):
-1. 新規 feature branch (例: `feat/ffi-benchmarks`) を `main` から切る
+1. 新規 feature branch (例: `feat/ffi-benchmarks`) を `main` から切る (現 main HEAD `220e01a`、Funs.lean は PR #17 で 4 サブモジュール `Funs/{Types, JustifiedSlots, ForkChoice, StateTransition}.lean` に分割済)
 2. `ConsensusLean4/FunsExternal.lean` の 5 axiom に real def を追加
-3. `ConsensusLean4/FastPath.lean` (新規) に `processAttestationsFast` + `processBlockFast` + `stateTransitionFast` を実装 — PR #3 のアルゴリズムを参考にコードはゼロから書き直し
-4. `ConsensusLean4/Ffi.lean` (新規) に `@[export]` wrapper 4 本を定義 (pipeline wrapper 2 本 + noop twin 2 本)
-5. `lakefile.lean` に必要最小限の設定 (`precompileModules := false`、static facet を build する target)
+3. `ConsensusLean4/FastPath.lean` (新規、top-level、`Funs.lean` umbrella と同階層) に `processAttestationsFast` + `processBlockFast` + `stateTransitionFast` を実装。`process_slots` / `process_block_header` は `Funs/StateTransition.lean` 内、`hash_tree_root_state` は `Funs/Types.lean` 内 (いずれも transitive import 経由で取得) — PR #3 のアルゴリズムを参考にコードはゼロから書き直し
+4. `ConsensusLean4/Ffi.lean` (新規、top-level) に `@[export]` wrapper 4 本を定義 (pipeline wrapper 2 本 + noop twin 2 本)。`compute_lmd_ghost_head` は `Funs/ForkChoice.lean:991` の Aeneas 出力を直接呼ぶ
+5. `lakefile.lean` は現 9 行据置で OK (`precompileModules` 不設定 = default false で Issue #5509 回避、`globs := #[.submodules \`ConsensusLean4]` も不要 = root の `import` で transitive 解決)
 6. `rust-ffi/` crate を**ゼロから**作成:
    - `src/lean_types.rs`: `State` / `Block` / `Validator` / `H256` / `Checkpoint` / `AggregatedAttestation` 等の Rust 構造体定義
    - `src/to_lean.rs`: `ToLean` trait 定義 + 各型の impl (`lean_alloc_ctor` / `lean_box_u64` / `lean_mk_empty_array` 等の FFI 呼び出し)
@@ -554,7 +554,7 @@ A8 で Option II (Rust 側 ToLean marshal) を採用決定。PR #2 が Option I 
 
 **P19. `alloc.vec.Vec` の proof を Rust から構築できない** → **A23 revised で解決** (2026-04-24)
 
-当初は Lean 側に Marshal.lean を作って per-type helper で proof を構築する案を立てたが、ユーザー指摘: Aeneas は formal proof を生成しない (Funs.lean は `def` のみ、`theorem` なし)。runtime では Lean の proof irrelevance により `Vec.property` は `lean_box(0)` に erase される。
+当初は Lean 側に Marshal.lean を作って per-type helper で proof を構築する案を立てたが、ユーザー指摘: Aeneas は formal proof を生成しない (Funs/{Types,JustifiedSlots,ForkChoice,StateTransition}.lean は `def` のみ、`theorem` なし)。runtime では Lean の proof irrelevance により `Vec.property` は `lean_box(0)` に erase される。
 
 → **proof 構築は不要**。Rust が Vec の ctor layout (tag 0, 2 obj fields: `val`, `property`) を直接組み立て、`property` 側には `lean_box(0)` を入れるだけで runtime 的に有効な Vec になる。Marshal.lean は作らない。
 
@@ -722,7 +722,7 @@ Issue 10-11 を合わせて 11 個。M4 を a/b/c に分割しているので、
 - **A23 (確定、§7.1 P19)**: Marshal.lean は**作らない**。Lean の proof irrelevance により `Vec α` の `property` フィールドは runtime に `lean_box(0)` に erase されるため、Rust が Vec の ctor layout (tag 0, 2 obj fields) を直接組んで OK。`wrap_list_as_vec(list: *mut lean_object) -> *mut lean_object` を Rust 側 1 関数だけ実装、element type 非依存。
 - **A24 (確定、§7.1 P20)**: Rust 側に `lean_list_nil()` / `lean_list_cons(head, tail)` / `list_from_iter(items, to_lean)` を `rust-ffi/src/to_lean.rs` に実装。iter.rev() + cons で正順 List を構築、N 要素で N 回 `lean_alloc_ctor`。
 - **A25 (確定、§7.1 P23)**: `lean_object*` の所有権は **owned / single-use** convention。Rust が FFI に渡したら即座に pointer を無効扱い、再利用禁止。Option A では Lean が consume して戻り値は UInt8 なので、Rust 側に `lean_inc_ref` / `lean_dec_ref` は**一切不要**。`@[export]` は PR #2 と同じく `@&` アノテーションなし (default owned) で書く。
-- **A26 (確定、§7.1 P5)**: モジュール初期化は **top-level エントリモジュール 1 本だけ**呼ぶ。`initialize_consensus_x2dlean4_ConsensusLean4_Ffi(1, null)` → 依存モジュール (Funs / FunsExternal / FastPath / Types) は Lean runtime が transitive に初期化してくれる。PR #2 の実績パターン踏襲。検証は M1 smoke で実機確認。
+- **A26 (確定、§7.1 P5)**: モジュール初期化は **top-level エントリモジュール 1 本だけ**呼ぶ。`initialize_consensus_x2dlean4_ConsensusLean4_Ffi(1, null)` → 依存モジュール (Funs umbrella + Funs/{Types, JustifiedSlots, ForkChoice, StateTransition} / FunsExternal / FastPath / Types) は Lean runtime が transitive に初期化してくれる。PR #2 の実績パターン踏襲。検証は M1 smoke で実機確認。
 - **A27 (確定、§7.1 P8)**: `csf_*_noop` twin は「入力を受けて pipeline を走らせず即 return」。具体的には `UInt8` sentinel を `0` で即返す。Lean の `@[export]` convention で入力 `lean_object*` は consume される (Lean runtime が dec_ref)。paired-delta が測るのは:
   - 主 wrapper: FFI 境界 + Lean 側 consume (dec_ref) + pipeline 本体
   - noop twin: FFI 境界 + Lean 側 consume (dec_ref) のみ
@@ -759,7 +759,7 @@ Issue 10-11 を合わせて 11 個。M4 を a/b/c に分割しているので、
 
 - `gh pr view 2 / 3 --json ...`, `gh pr diff 2 / 3`, `gh api .../pulls/{n}/commits`
 - Aeneas `Vec.lean` @ `864eddb4` を GitHub raw で取得
-- `/home/adust/consensus-lean4/ConsensusLean4/Funs.lean` を直接読んで 2 エントリポイントのループ構造を確認
+- `ConsensusLean4/Funs/StateTransition.lean` (`state_transition.state_transition` @ :1356) と `ConsensusLean4/Funs/ForkChoice.lean` (`compute_lmd_ghost_head` @ :991) を直接読んで 2 エントリポイントのループ構造を確認 (2026-04-24 時点では旧 `Funs.lean` 単一ファイル、PR #17 マージ後 2026-04-30 から現構成)
 - leanprover/lean4 Issue #5509, #9420, #7917 の記述を参照
 - 実例 repos: lurk-lab/RustFFI.lean, DSLstandard/Lean4-FFI-Programming-Tutorial-GLFW, leanprover/lean4 `src/lake/examples/reverse-ffi/`
 
@@ -944,13 +944,15 @@ Rust binary が最終的に必要とするもの:
 
 | 担当 | ファイル |
 |---|---|
-| **自分で書く** | `ConsensusLean4/{FastPath, Ffi, FunsExternal}.lean`、`rust-ffi/src/*.rs`、`rust-ffi/build.rs`、`rust-ffi/Cargo.toml`、`lakefile.lean` (最小限) |
-| **Aeneas が再生成する** | `ConsensusLean4/{Funs, Types, FunsExternal_Template}.lean` (手動編集しない、ただし FunsExternal.lean は Aeneas に上書きされない) |
+| **自分で書く (新規)** | `ConsensusLean4/FastPath.lean`、`ConsensusLean4/Ffi.lean`、`rust-ffi/src/*.rs`、`rust-ffi/build.rs`、`rust-ffi/Cargo.toml` |
+| **自分で書く (既存編集)** | `ConsensusLean4/FunsExternal.lean` (axiom 5 本置換)、`ConsensusLean4.lean` (root index に `import ConsensusLean4.Ffi` 追加)、`.gitignore` (`rust-ffi/target/` 追加) |
+| **Aeneas が再生成する (手動編集しない)** | `ConsensusLean4/Types.lean`、`ConsensusLean4/Funs.lean` (umbrella、import 4 本のみ)、`ConsensusLean4/Funs/{Types, JustifiedSlots, ForkChoice, StateTransition}.lean`、`ConsensusLean4/FunsExternal_Template.lean` |
+| **lakefile** | `lakefile.lean` (現 9 行据置、`globs := #[.submodules \`ConsensusLean4]` は不要) |
 | **Lake が自動で作る** | `.lake/build/lib/*.olean`、`.lake/build/lib/*.ilean`、`.lake/build/ir/*.c`、`.lake/build/ir/*.c.o.export`、`.lake/build/ir/*.c.o.noexport`、`.lake/build/lib/*.a` |
 | **toolchain 付属 (自分ではビルドしない)** | `libleanshared.so`、`libInit_shared.so`、`lean_*` runtime 関数群 |
 | **Cargo が自動で作る** | `rust-ffi/target/release/*` (最終 binary) |
 
-`.lake/` と `target/` は `.gitignore` 対象 (既存 `.gitignore` で `.lake/` は除外済)。
+`.lake/` と `target/` は `.gitignore` 対象 (現 `.gitignore`: `.lake/` `lake-packages/` `build/` `rust-ffi/target/` の 4 行)。
 
 ---
 
@@ -965,11 +967,17 @@ Rust binary が最終的に必要とするもの:
 - ✓ §6.1 「C5 詳細: 署名検証と Rust 連携」docs 同期
 - ✓ `docs/ffi-implementation-plan.md` 作成 + push (commit `561b2f9`)
 - ✓ 事前検証: PR #2 実ソース / Types.lean State 構造 / 現 main FunsExternal の確認
-- ✓ §7.1 予見問題 P17-P30 列挙、§7.2 GitHub issue 分割案を追加 (本更新)
+- ✓ §7.1 予見問題 P17-P30 列挙、§7.2 GitHub issue 分割案を追加
+
+更新 (2026-04-30):
+- ✓ PR #17 マージ (Funs.lean → Funs/{Types,JustifiedSlots,ForkChoice,StateTransition}.lean に namespace 別分割) を反映
+- ✓ §2.1 / §2.2 / §4.1 骨子手順 3 / §10 / §11.8 のファイルパスと行番号を新構成に書き換え
+- ✓ §A26 transitive 初期化対象に Funs/ サブモジュール 4 本を明示
+- ✓ `feat/ffi-benchmarks` を main `220e01a` 直上に rebase (HEAD `d562753`)
 
 残り (承認後):
-1. §7.1 / §7.2 を `docs/ffi-feasibility.md` に同期 (plan mode 中は plan ファイル以外を編集できないため保留中)
-2. **P11 future work の GitHub issue を作成**: 「realistic block-building benchmark (state chaining across blocks)」として issue 化、受け入れ条件とセットで記録
-3. Epic + 11 サブ issue を GitHub に作成 (§7.2 案)
+1. ✓ §7.1 / §7.2 を `docs/ffi-feasibility.md` に同期 (2026-04-24 完了)
+2. ✓ [issue #6](https://github.com/NyxFoundation/consensus-lean4/issues/6) 作成 (P11: realistic block-building benchmark, state chaining across blocks)
+3. ✓ Epic + サブ issue を GitHub に作成 (issue #7-#16)
 4. 実装は Epic の sub-issue 毎に進める (M0 → M1 → M2 → … の順)
 5. lean-toolchain 変更が必要になった場合は**単独で**再確認 (包括承認下でも別扱い)
