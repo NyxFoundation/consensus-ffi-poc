@@ -17,16 +17,27 @@ The generated Lean code covers the core consensus algorithms:
 ConsensusLean4.lean                  -- root index, re-exports the three modules below
 ConsensusLean4/
 ├── Types.lean                       -- `H256`, `Checkpoint`, `Block`, …
-├── Funs.lean                        -- all function bodies (~3000 LOC, axiom-free)
+├── Funs.lean                        -- umbrella that imports the four submodules below
+├── Funs/
+│   ├── Types.lean                   -- `types.*` defs (H256 instances, hash-tree-root stubs, clone instances)
+│   ├── JustifiedSlots.lean          -- `justified_slots.*` defs
+│   ├── ForkChoice.lean              -- `fork_choice.*` defs (LMD GHOST)
+│   └── StateTransition.lean         -- `state_transition.*` defs (block + attestation processing)
 ├── FunsExternal_Template.lean       -- auto-generated signatures for external functions
 └── FunsExternal.lean                -- active implementation file (edit this)
 ```
 
-`Funs.lean` imports `ConsensusLean4.FunsExternal`, so `FunsExternal.lean` is the
-single swap point for anyone wanting to replace the `axiom` stubs with real Lean
-implementations. `FunsExternal_Template.lean` is refreshed on every Aeneas run and
-serves as the canonical signature reference — diff it against `FunsExternal.lean`
-to catch upstream signature drift.
+`Funs.lean` was originally a single ~3000-line file emitted by Aeneas; it has
+been manually split into the four submodules above so each namespace can be
+reviewed independently. **Re-running Aeneas would overwrite `Funs.lean` with a
+single monolithic module again** — if you need to regenerate, expect to redo
+the split or drop it.
+
+`Funs/*.lean` import `ConsensusLean4.FunsExternal`, so `FunsExternal.lean` is
+the single swap point for anyone wanting to replace the `axiom` stubs with
+real Lean implementations. `FunsExternal_Template.lean` is refreshed on every
+Aeneas run and serves as the canonical signature reference — diff it against
+`FunsExternal.lean` to catch upstream signature drift.
 
 The extracted code is wrapped in `noncomputable section` because the five standard
 library functions used by the Rust source (`Vec::clear`, `Vec::is_empty`,
