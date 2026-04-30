@@ -12,6 +12,14 @@
 --       3 = Aeneas Result.div (non-termination)
 --   * `*_noop` twins discard the inputs and return 0 immediately. Used as
 --     paired-delta references so benchmarks subtract pure FFI/dec_ref cost.
+--
+-- The "real" ToLean marshal layer (A23) is deferred — boxed-lean_object*
+-- ABI for Aeneas's UScalar/BitVec/Array types is non-trivial and the
+-- smoke goal is reachable with primitive-arg Lean-side builders. The
+-- builders below take only `UInt64` / `UInt8` and assemble the State /
+-- Block on the Lean side; bench harnesses call them once per iteration
+-- before starting the timer, so marshal cost is excluded from the
+-- pipeline measurement just like the original plan intended.
 import ConsensusLean4.FastPath
 import ConsensusLean4.Funs
 import ConsensusLean4.Types
@@ -67,3 +75,78 @@ def csfComputeLmdGhostHeadNoop
     (_blocks : alloc.vec.Vec (types.H256 × (Std.U64 × types.H256)))
     (_attestations : alloc.vec.Vec (Std.U64 × types.AttestationData))
     (_min_score : Std.U64) : UInt8 := 0
+
+/-! ## Lean-side smoke fixtures
+
+Hard-coded V=2 inputs so the M4c smoke can drive both pipelines without
+the full Rust↔Lean marshal layer. Bench scaling (variable N) requires
+either a generalised builder or proper Rust-side ToLean — both deferred. -/
+
+private def smokeValidatorsVec : alloc.vec.Vec types.Validator :=
+  let xs : List types.Validator :=
+    [ { pubkey := Array.repeat 52#usize 0#u8, index := 0#u64 }
+    , { pubkey := Array.repeat 52#usize 0#u8, index := 1#u64 } ]
+  ⟨xs, by simp [xs]; scalar_tac⟩
+
+private def smokeGenesisState : types.State :=
+  let zeroCp : types.Checkpoint := { root := types.H256.ZERO, slot := 0#u64 }
+  let zeroHeader : types.BlockHeader :=
+    { slot := 0#u64
+      proposer_index := 0#u64
+      parent_root := types.H256.ZERO
+      state_root := types.H256.ZERO
+      body_root := types.H256.ZERO }
+  { config := { genesis_time := 0#u64 }
+    slot := 0#u64
+    latest_block_header := zeroHeader
+    latest_justified := zeroCp
+    latest_finalized := zeroCp
+    historical_block_hashes := alloc.vec.Vec.new types.H256
+    justified_slots := alloc.vec.Vec.new Bool
+    validators := smokeValidatorsVec
+    justifications_roots := alloc.vec.Vec.new types.H256
+    justifications_validators := alloc.vec.Vec.new Bool }
+
+-- For 2 validators at slot 1, expected proposer = 1 % 2 = 1.
+private def smokeBlockAtSlot1 : types.Block :=
+  { slot := 1#u64
+    proposer_index := 1#u64
+    parent_root := types.H256.ZERO
+    state_root := types.H256.ZERO
+    body := { attestations := alloc.vec.Vec.new types.AggregatedAttestation } }
+
+-- Same proposer as above but slot=0 reused → process_slots returns
+-- StateSlotIsNewer (sentinel 1, the domain-error branch).
+private def smokeBlockBadSlot : types.Block :=
+  { slot := 0#u64
+    proposer_index := 0#u64
+    parent_root := types.H256.ZERO
+    state_root := types.H256.ZERO
+    body := { attestations := alloc.vec.Vec.new types.AggregatedAttestation } }
+
+-- The dummy `_seed` arg keeps Lean's compiler from emitting these as
+-- module-level constants (which would land in BSS instead of TEXT and need
+-- `extern static` on the Rust side); a function with one scalar arg gets
+-- a proper TEXT symbol that Rust can `extern fn` against.
+
+/-- Smoke entry: 2-validator genesis, advance one slot, no attestations. -/
+@[export csf_smoke_state_transition_ok]
+def csfSmokeStateTransitionOk (_seed : UInt64) : UInt8 :=
+  packStatePipeline
+    (ConsensusLean4.FastPath.stateTransitionFast smokeGenesisState smokeBlockAtSlot1)
+
+/-- Smoke entry: same state, broken block.slot → domain error sentinel 1. -/
+@[export csf_smoke_state_transition_err]
+def csfSmokeStateTransitionErr (_seed : UInt64) : UInt8 :=
+  packStatePipeline
+    (ConsensusLean4.FastPath.stateTransitionFast smokeGenesisState smokeBlockBadSlot)
+
+/-- Smoke entry for fork choice: empty blocks → fall through to (start_root, []). -/
+@[export csf_smoke_compute_lmd_ghost_head_empty]
+def csfSmokeComputeLmdGhostHeadEmpty (_seed : UInt64) : UInt8 :=
+  packForkChoice
+    (fork_choice.compute_lmd_ghost_head
+      types.H256.ZERO
+      (alloc.vec.Vec.new (types.H256 × (Std.U64 × types.H256)))
+      (alloc.vec.Vec.new (Std.U64 × types.AttestationData))
+      0#u64)

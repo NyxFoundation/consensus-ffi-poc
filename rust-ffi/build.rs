@@ -64,9 +64,13 @@ fn run_lake_build(repo_root: &Path) {
 // IR directories that ship `.c.o.export` files we need to link. The repo's own
 // IR plus every transitive dependency that has been built. Mathlib's meta-build
 // helpers (Cache / LongestPole / Shake) ship objects we must NOT link in.
+//
+// The Aeneas package nests its Lake build under `backends/lean/.lake/...`
+// because the package root contains both the OCaml compiler sources and the
+// Lean backend; everything else uses the `<pkg>/.lake/build/ir` convention.
 const IR_ROOT_HINTS: &[&[&str]] = &[
     &[".lake", "build", "ir"],
-    &[".lake", "packages", "aeneas", ".lake", "build", "ir"],
+    &[".lake", "packages", "aeneas", "backends", "lean", ".lake", "build", "ir"],
     &[".lake", "packages", "mathlib", ".lake", "build", "ir"],
     &[".lake", "packages", "batteries", ".lake", "build", "ir"],
     &[".lake", "packages", "aesop", ".lake", "build", "ir"],

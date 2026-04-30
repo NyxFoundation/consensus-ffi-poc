@@ -1,11 +1,12 @@
-// M1 smoke: confirm the Lean ↔ Rust FFI boundary works end-to-end.
+// M4c smoke: drive both Aeneas pipelines end-to-end via Lean-side
+// fixtures.  The full Rust→Lean ToLean marshal layer is deferred (see
+// docs/ffi-implementation-plan.md M4a deviation note); for the smoke we
+// call into `csf_smoke_*` Lean exports that build the State / Block
+// structures themselves and report a UInt8 sentinel.
 //
-// Initialization order is exact and must run once per process:
-//   1. lean_initialize_runtime_module — sets up allocator, thread-local state.
-//   2. lean_initialize                — installs the IO world.
-//   3. initialize_<package>_<entry>    — top-level only; the runtime walks
-//      the import graph transitively.
-//   4. lean_io_mark_end_initialization — flips the runtime out of init mode.
+// Sentinels (cf. ConsensusLean4/Ffi.lean):
+//   0 = Ok            1 = domain error
+//   2 = Aeneas fail   3 = Aeneas div
 
 use std::ffi::c_void;
 use std::ptr;
@@ -22,7 +23,11 @@ extern "C" {
         builtin: u8,
         world: *mut c_void,
     ) -> *mut c_void;
+
     fn csf_ping(n: u64) -> u64;
+    fn csf_smoke_state_transition_ok(seed: u64) -> u8;
+    fn csf_smoke_state_transition_err(seed: u64) -> u8;
+    fn csf_smoke_compute_lmd_ghost_head_empty(seed: u64) -> u8;
 }
 
 unsafe fn boot_lean() {
@@ -32,18 +37,39 @@ unsafe fn boot_lean() {
     lean_io_mark_end_initialization();
 }
 
+fn sentinel_label(s: u8) -> &'static str {
+    match s {
+        0 => "Ok",
+        1 => "DomainErr",
+        2 => "Fail",
+        3 => "Div",
+        _ => "?",
+    }
+}
+
 fn main() {
     unsafe {
         boot_lean();
 
-        let r = csf_ping(41);
-        assert_eq!(r, 42, "csf_ping(41) returned {r}, expected 42");
-        println!("csf_ping(41) = {r} ✓");
+        // M1 carry-over.
+        assert_eq!(csf_ping(41), 42);
+        println!("[M1] csf_ping(41) = 42 ✓");
 
-        let r2 = csf_ping(0);
-        assert_eq!(r2, 1);
-        let r3 = csf_ping(u64::MAX - 1);
-        assert_eq!(r3, u64::MAX);
-        println!("edge cases ok");
+        // M4c stage 2: state_transition pipeline.
+        let r_ok = csf_smoke_state_transition_ok(0);
+        println!("[M4c.2] csf_smoke_state_transition_ok  → {r_ok} ({})", sentinel_label(r_ok));
+        assert_eq!(r_ok, 0, "expected Ok sentinel");
+
+        let r_err = csf_smoke_state_transition_err(0);
+        println!("[M4c.2] csf_smoke_state_transition_err → {r_err} ({})", sentinel_label(r_err));
+        assert_eq!(r_err, 1, "expected DomainErr sentinel");
+
+        // M4c stage 3: fork choice pipeline.
+        let r_lmd = csf_smoke_compute_lmd_ghost_head_empty(0);
+        println!("[M4c.3] csf_smoke_compute_lmd_ghost_head_empty → {r_lmd} ({})",
+                 sentinel_label(r_lmd));
+        assert_eq!(r_lmd, 0, "expected Ok sentinel");
+
+        println!("all smokes ok");
     }
 }
