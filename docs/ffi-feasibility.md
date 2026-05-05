@@ -1,6 +1,6 @@
 ---
 title: Rust ↔ Lean 4 FFI ベンチマーク実現可能性 調査メモ
-last_updated: 2026-04-30
+last_updated: 2026-05-05
 tags:
   - ffi
   - benchmark
@@ -237,6 +237,8 @@ Vec α := { l : List α // l.length ≤ Usize.max }
 | 32,000 | 128 | 1.3·10¹¹ ops | ~100 s ← 要 fast path (**本タスクでは対象外**) |
 
 compute_lmd_ghost_head は **N 非依存**。Aeneas 出力は O(A·B²) なので、**本タスクのデフォルトは B ≤ 10K で打ち止め** (mainnet 級 B=32K は追加で `compute_lmd_ghost_head_fast` を書く必要があり、別スコープ)。
+
+> 注: 計算量の authoritative 記述は [`ConsensusLean4/Ffi.lean#L61`](../ConsensusLean4/Ffi.lean#L61) (`linear in attestations, quadratic in blocks`) および [`docs/timing-budget.md`](./timing-budget.md) §6 を参照。本セクションの `O(A·B²)` 表記は経験的外挿の根拠付けであり、形式的解析ではない。
 
 #### 理論下限 (参考、計測しない)
 

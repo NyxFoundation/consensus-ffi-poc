@@ -1,6 +1,6 @@
 ---
 title: Rust ↔ Lean 4 FFI ベンチマーク 実装計画
-last_updated: 2026-04-30
+last_updated: 2026-05-05
 tags:
   - ffi
   - implementation
@@ -273,6 +273,8 @@ def csfComputeLmdGhostHeadNoop
 **実行環境**: ローカル (Linux 6.18+kali、CPU governor performance、`taskset -c <core>` でピン止め)
 
 **Goal**: 計画したスケール階段で実測、結果を docs に集計
+
+> 判定基準: [`docs/timing-budget.md`](./timing-budget.md) を参照。pass/fail は project SLO target (state_transition < 200ms / fork choice < 100ms) を主基準、outer limit (< 800ms) を補助列として使う。
 
 - **state_transition**: N ∈ {100, 1K, 10K, 100K}, A=64, 5 試行ずつ (N=1M は 1 試行参考値)
 - **compute_lmd_ghost_head**: (B, A) ∈ {100, 1K, 10K} × {32, 128}, 5 試行ずつ
