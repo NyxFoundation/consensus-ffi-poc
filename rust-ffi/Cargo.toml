@@ -5,6 +5,19 @@ edition = "2021"
 publish = false
 
 [dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "rust-ffi"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench-state-transition"
+path = "src/bin/bench-state-transition.rs"
+
+[[bin]]
+name = "bench-fork-choice"
+path = "src/bin/bench-fork-choice.rs"
 
 [profile.release]
 debug = true
