@@ -30,6 +30,10 @@ path = "src/bin/bench-ffi-overhead.rs"
 name = "bench-ffi-marshal"
 path = "src/bin/bench-ffi-marshal.rs"
 
+[[bin]]
+name = "bench-ffi-ssz"
+path = "src/bin/bench-ffi-ssz.rs"
+
 [profile.release]
 debug = true
 lto = "thin"

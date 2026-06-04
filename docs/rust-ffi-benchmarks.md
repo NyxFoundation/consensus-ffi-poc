@@ -9,6 +9,7 @@ tags:
   - fork-choice
   - boundary-cost
   - marshalling
+  - decode
 ---
 
 # Rust ↔ Lean 4 FFI ベンチマーク 実測結果
@@ -225,6 +226,59 @@ target/release/bench-ffi-overhead
 cd consensus-lean4 && lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release --bin bench-ffi-marshal
 target/release/bench-ffi-marshal
+```
+
+## 4d. End-to-end SSZ-bytes パイプライン 追測 (2026-06-04)
+
+§4b/§4c は「①marshal」だけを測り、「②decode → ③純粋関数」が未接続だった。本節でその全経路を繋いだ ——`ByteArray` を**型付き `State`/`Block` にデコードし、純粋 `stateTransitionFast` に渡す**。`bench-ffi-ssz` (`rust-ffi/src/bin/bench-ffi-ssz.rs`) + `ConsensusLean4/Ffi.lean` M7。
+
+- **コーデック**: フラットな length-prefixed バイナリ (正準 SSZ ではない) を Lean decode (`decodeState`/`decodeBlock`) と Rust serializer (`serialize_fixture`) で round-trip。`State`/`Block` の全フィールドを網羅。**`hash_tree_root`/SHA は不使用** (decode は純粋なバイト配置)。
+- **fixture は §1 と byte-for-byte 一致**: `buildBenchState(n)`/`buildBenchBlock(n)` と同一内容を直列化。よって decode 後の入力は §1 のスカラー生成版と等価で、STF コストを直接比較できる。
+- **正当性ゲート**: `csf_bench_state_transition_ssz_run` が全 N で sentinel **0 (Ok)** を返すことを assert。誤ったコーデックなら sentinel が変わるかクラッシュするため、これがパイプライン全体の正当性検証になっている。
+- **分解**: marshal = `_marshal_noop`、decode = `_ssz_decode` − marshal、STF = `_ssz_run` − `_ssz_decode`。
+
+### 計測結果
+
+| N | payload | marshal | decode | STF | total (e2e) |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 6.2 KB | 113 ns | 111 µs | 47.6 µs | 159 µs |
+| 1,000 | 58.9 KB | 1.60 µs | 1.06 ms | 83.4 µs | 1.14 ms |
+| 10,000 | 586.3 KB | 20.0 µs | 12.23 ms | 347 µs | 12.60 ms |
+| 100,000 | 5.7 MB | 220 µs | 139.46 ms | 5.05 ms | **144.73 ms** |
+
+(N=1M は `--include-1m` で opt-in。decode が ~1.4 µs/validator で線形のため ~1.4 s/call ＋ 数 GB RSS と推定。常用せず。)
+
+### 判定 — §4b/§4c の予測を **訂正**
+
+§4c では「実運用 FFI コストの新規項は **marshal**(alloc+memcpy)で、mainnet で STF と肩を並べる」と予測した。**実測はこれを覆した**:
+
+1. **支配項は marshal ではなく decode**。N=100K で marshal 220 µs に対し **decode 139 ms** —— marshal の **約 630 倍**、STF (5 ms) の **約 28 倍**。memcpy は速い (~26 GB/s、§4c と一致) が、バイト列を **Aeneas の List-backed 型へ materialize する**コストが桁違いに大きい。
+2. **decode は N に線形 (~1.4 µs/validator)** だが定数が巨大。原因は Aeneas 表現: `pubkey : Array Std.U8 52` が **52 要素の連結リスト**で、それが N 個 + `validators : Vec` 自体も List。実データを入れると 1 validator あたり 52 ノードの list 構築が走る。
+3. **STF も §1 より重い** (100K で 5.05 ms vs §1 1.80 ms、~2.8×)。§1 は全 validator が `Array.repeat` の**同一共有オブジェクト**だったが、decode 版は各 validator が**別個のオブジェクト**。実データでは共有が効かず、STF の走査が distinct なキャッシュライン/参照カウントに当たるため。**§1 の 22 ms@1M は共有による楽観値**だった、という重要な含意。
+4. **marshal の相対的軽さが確定**: §4c 単独では「14 ms@1M は無視できない」と見えたが、decode と並べると marshal は誤差。**ボトルネックは一貫して Aeneas の List-backed 表現**で、これは fork-choice の O(B²)(§2)と同一の根本原因。
+
+### この経路の全体像
+
+```
+[Rust bytes] ──①marshal──▶ [ByteArray] ──②decode──▶ [typed State/Block] ──③STF──▶ sentinel
+  serialize       220µs@100K(誤差)      139ms@100K(支配項)        5ms@100K
+```
+
+「FFI を実データで使う」コストの正体は **越境でも memcpy でもなく、検証用 Aeneas 型への materialize**。改善は (a) decode 先を Array-backed の高速表現にする、(b) `validators` を flat buffer のまま保持し遅延デコードする、等。issue #4 の本質的課題はマーシャルではなく **decode 表現** にあることが定量的に判明した。
+
+### 限界
+
+- フラットコーデックで正準 SSZ wire 非互換 (offset/union 等は未対応)。実 devnet テストベクタとの互換は別途。
+- 片道のみ (結果 `State` のエンコード+復路は未計測)。
+- decode 先が List-backed なのは Aeneas 既定。Array-backed への変更で decode/STF とも大きく変わる見込み (future work)。
+
+### 再現
+
+```bash
+cd consensus-lean4 && lake build ConsensusLean4:static
+cd rust-ffi && cargo build --release --bin bench-ffi-ssz
+target/release/bench-ffi-ssz            # N=100..100K
+target/release/bench-ffi-ssz --include-1m
 ```
 
 ## 5. Future work
