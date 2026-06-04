@@ -8,6 +8,7 @@ tags:
   - state-transition
   - fork-choice
   - boundary-cost
+  - marshalling
 ---
 
 # Rust ↔ Lean 4 FFI ベンチマーク 実測結果
@@ -165,6 +166,65 @@ target/release/bench-fork-choice --single-cell=100,128
 cd consensus-lean4 && lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release --bin bench-ffi-overhead
 target/release/bench-ffi-overhead
+```
+
+## 4c. FFI マーシャリングコスト 追測 (2026-06-04)
+
+§4b で「プリミティブ越境は ~0、ただしこれは床値。実運用の FFI コストは `lean_object*` のマーシャル/dec_ref で、それは未測定」と結論した。その未測定分を `bench-ffi-marshal` (`rust-ffi/src/bin/bench-ffi-marshal.rs`) で直接計測した。
+
+本来の SSZ-bytes 境界 (issue #4) で新規に立つコスト ——「Rust 側で `ByteArray` を構築 (alloc + memcpy O(size)) → owned 引数として越境 → Lean ランタイムが dec_ref」—— を、ペイロードサイズの関数として測る。`ByteArray` はフラットバッファなので **SSZ コーデックも `hash_tree_root`/SHA も不要** (serde はバイト並びのみ)。
+
+- `csf_make_bytearray` (C shim, `rust-ffi/csf_marshal_shim.c`): `lean_alloc_sarray` + `memcpy`。`lean_alloc_sarray`/`lean_sarray_cptr` は lean.h で `static inline` のため Rust から直接リンクできず、lean.h に対してコンパイルした C shim 経由で呼ぶ (build.rs が `cc` でビルド)。
+- Lean export 2 種 (`ConsensusLean4/Ffi.lean` M6): `csf_bench_marshal_touch` = 全バイトを XOR-fold (decode スキャンの下限)、`csf_bench_marshal_noop` = 引数を消費するだけ (alloc + memcpy + dec_ref)。差 = Lean 側スキャン。
+- サイズ軸は §1 の N に対応: Validator = pubkey(52)+index(8) = 60 B とし、ペイロード S = N·60。**正準 SSZ ではなく代表サイズのフラットバッファ。** 計測手法は §1/§4b と同様 (target 200ms/trial, 11 試行中央値, `black_box`)。
+
+### 計測結果
+
+| N | payload S | marshal (noop) | full (marshal+scan) | scan Δ | marshal GB/s | marshal ns/byte |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 60 B | 25.3 ns | 32.3 ns | 7.0 ns | 2.4 | 0.422 |
+| 100 | 5.9 KB | 114 ns | 235 ns | 121 ns | 52.4 | 0.019 |
+| 1,000 | 58.6 KB | 1.32 µs | 2.84 µs | 1.52 µs | 45.5 | 0.022 |
+| 10,000 | 585.9 KB | 20.5 µs | 32.1 µs | 11.6 µs | 29.3 | 0.034 |
+| 100,000 | 5.7 MB | 223 µs | 351 µs | 128 µs | 26.9 | 0.037 |
+| 1,000,000 | 57.2 MB | **14.39 ms** | 16.64 ms | 2.25 ms | 4.2 | 0.240 |
+
+### 判定 (vs §1 の STF 計算コスト)
+
+| N | marshal (片道) | §1 STF pipeline | marshal / STF |
+|---:|---:|---:|---:|
+| 100 | 114 ns | 41.3 µs | 0.3% |
+| 100,000 | 223 µs | 1.80 ms | 12% |
+| 1,000,000 | **14.39 ms** | 22.02 ms | **65%** |
+
+→ **§4b の予測どおり、オーバーヘッドはサイズに比例して変化する。**
+
+1. **小サイズ (devnet 相当, validator 数百 = KB 級)**: 100〜1,300 ns。§4b のプリミティブ越境と同様、**実質ノイズ**。SSZ 化しても体感不変。
+2. **大サイズ (mainnet 相当, validator 1M = ~57 MB)**: 片道 **14.4 ms** で、STF 計算本体 (22 ms) の **約 65%**。往復 (入力デコード + 結果エンコード) なら ~29 ms で STF を上回る。**この規模ではマーシャルが支配項の一つになる**。
+3. **スループットの劣化**: 小サイズで ~52 GB/s (L2/L3 内に収まる) → 57 MB で 4.2 GB/s。これは純粋な memcpy 帯域ではなく、**呼び出しごとに 57 MB を新規 alloc → first-touch ページフォルト → memcpy → dec_ref/free** するためで、per-call マーシャルの現実的なコスト構造を反映している。
+4. **Lean 側スキャン (scan Δ) は安価**: ~0.03–0.04 ns/byte (~25–30 GB/s)。decode の「全バイト走査」部分は memcpy と同オーダーで、マーシャルの支配項は alloc+copy 側。
+
+### §4b との関係 (FFI コストの全体像)
+
+| 入力形態 | 越境あたりのコスト | スケール |
+|---|---|---|
+| プリミティブ `UInt64` (§4b) | ~1.9 ns | サイズ非依存 (定数) |
+| `ByteArray` マーシャル (本節) | 25 ns 〜 14 ms | **O(payload size)** |
+
+「FFI は速い」は **プリミティブ境界に限った話**。データを渡す実運用では、コストは渡すバイト数に線形で、mainnet 規模では STF と肩を並べる。
+
+### 限界
+
+- **正準 SSZ ではない**: フラットな代表バッファで、可変長フィールドの offset や型付きデコードは含まない。型付き `State` への decode を入れると scan Δ 側が増えるが、マーシャル (alloc+memcpy) の支配性は変わらない見込み (issue #4 で要確認)。
+- **片道のみ**: 結果 `State` のエンコード + 復路は未計測。実運用は往復なので概ね 2 倍が目安。
+- **zero-copy の余地**: Lean が呼び出し中に読むだけなら borrowed pointer 受けで memcpy を回避できる可能性 (§4b 限界参照)。本計測は owned-copy 前提の上限値。
+
+### 再現
+
+```bash
+cd consensus-lean4 && lake build ConsensusLean4:static
+cd rust-ffi && cargo build --release --bin bench-ffi-marshal
+target/release/bench-ffi-marshal
 ```
 
 ## 5. Future work

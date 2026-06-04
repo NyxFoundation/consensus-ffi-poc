@@ -312,3 +312,27 @@ def csfBenchComputeLmdGhostHeadBuildOnly
   let blocks := buildForkChoiceBlocks b
   let atts := buildForkChoiceAttestations b a
   consumeBlocksVec blocks ^^^ consumeAttsVec atts
+
+/-! ## M6 — FFI marshalling cost.
+
+The §1/§2 benches cross only primitive `UInt64`, so they measure Lean-side
+compute with the (near-zero) boundary cost cancelled out. This pair measures
+the cost the *real* SSZ-bytes boundary (issue #4) would add: a `ByteArray`
+(`lean_sarray_object`) is built on the Rust side via the `csf_make_bytearray`
+C shim (alloc + memcpy O(size)), handed to the export as an owned argument,
+and dec_ref'd by Lean's runtime on return.
+
+No SSZ codec and no `hash_tree_root`/SHA are involved — `ByteArray` is a flat
+buffer, so (de)serialization is pure byte layout. `_touch` reads every byte
+(XOR-fold), a lower bound on what a real decoder pays to scan its input;
+`_noop` only consumes the argument, isolating alloc + memcpy + dec_ref. -/
+
+/-- Touch every byte (decode-scan lower bound). Consumes `data` (dec_ref). -/
+@[export csf_bench_marshal_touch]
+def csfBenchMarshalTouch (data : ByteArray) : UInt8 :=
+  data.foldl (fun acc x => acc ^^^ x) 0
+
+/-- Consume `data` without reading it. Paired-delta twin: the gap from
+`_touch` is the Lean-side byte-scan, leaving alloc + memcpy + dec_ref. -/
+@[export csf_bench_marshal_noop]
+def csfBenchMarshalNoop (_data : ByteArray) : UInt8 := 0
