@@ -19,6 +19,10 @@ path = "src/bin/bench-state-transition.rs"
 name = "bench-fork-choice"
 path = "src/bin/bench-fork-choice.rs"
 
+[[bin]]
+name = "bench-ffi-overhead"
+path = "src/bin/bench-ffi-overhead.rs"
+
 [profile.release]
 debug = true
 lto = "thin"

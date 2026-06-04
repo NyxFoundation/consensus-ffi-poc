@@ -1,12 +1,13 @@
 ---
 title: Rust ↔ Lean 4 FFI ベンチマーク 実測結果
-last_updated: 2026-05-05
+last_updated: 2026-06-04
 tags:
   - benchmark
   - ffi
   - results
   - state-transition
   - fork-choice
+  - boundary-cost
 ---
 
 # Rust ↔ Lean 4 FFI ベンチマーク 実測結果
@@ -132,6 +133,38 @@ target/release/bench-state-transition --single-n=100000
 target/release/bench-state-transition --single-n=1000000
 target/release/bench-fork-choice --single-cell=100,32
 target/release/bench-fork-choice --single-cell=100,128
+```
+
+## 4b. FFI 境界コスト 追測 (2026-06-04)
+
+§1/§2 の `pipeline (Δ)` は paired-delta で **FFI 越境コストを相殺**しており、境界そのもののコストは測っていなかった。これを別ハーネス `bench-ffi-overhead` (`rust-ffi/src/bin/bench-ffi-overhead.rs`) で直接計測した。
+
+計測対象は `csf_ping` (`@[export] def csfPing (n : UInt64) : UInt64 := n + 1`) — 最小の `@[export]`。Rust から tight loop で叩き、`black_box` で DCE を抑止して 1 コールあたりのコストを出す。比較基準は同形の Rust ローカル不透明関数 `rust_ping` (`#[inline(never)]`)。差分が「Rust→Lean 越境が、通常の非インライン関数呼び出しに上乗せするコスト」。
+
+計測環境は §計測環境と同一 (Ryzen 9 PRO 8945HS, release + thin LTO)。iters/trial は target 200ms に適応キャリブレーション、15 試行の中央値。
+
+| call path | median | min | IQR |
+|---|---:|---:|---:|
+| **FFI** `csf_ping` (Rust→Lean) | **~1.9 ns** | ~1.3 ns | ~0.4 ns |
+| Rust-local `rust_ping` (越境なし) | ~1.9 ns | ~1.3 ns | ~0.4 ns |
+| **境界オーバーヘッド (差分)** | **−0.06 〜 +0.12 ns** (4 回反復) | — | — |
+
+### 判定
+
+**プリミティブ引数の FFI 越境オーバーヘッドは測定ノイズ以下 (実質ゼロ)。** `csf_ping` の FFI 呼び出しは通常の非インライン関数呼び出し (~1.9 ns) と統計的に区別できない。Lean の `@[export]` は名前マングルなしの C シンボルを出し、`UInt32`/`UInt64` 等のアンボックス型は unbox のまま渡るため、生成されるのは単なる `call` 命令 1 個で、ランタイムのトランポリンも箱詰めも介在しない。
+
+→ §1/§2 が paired-delta で越境コストを相殺した設計判断は妥当だった (相殺対象が元々ゼロ)。
+
+### 限界 (重要)
+
+**これは床値であって実運用の FFI コストではない。** 本ビルドには構造体マーシャル層 (`docs/ffi-feasibility.md` A23 / issue #4) が存在せず、境界を渡るのは `UInt64` のみ。実運用で支配的になる **`lean_object*` の箱詰め・`Array`/`Vec` のコピー・参照カウント (inc/dec) のコストは未測定**。`Ffi.lean` の `csf_*_noop` ツイン (構造体引数を受けて即 return; "subtract pure FFI/dec_ref cost" のための足場) は本追測では未使用 — Rust 側に lean_object* を組む ToLean 層が無く呼べないため。dec_ref/マーシャルの実測は issue #4 (Option III SSZ バイト列マーシャル) 実装後に行う。
+
+### 再現
+
+```bash
+cd consensus-lean4 && lake build ConsensusLean4:static
+cd rust-ffi && cargo build --release --bin bench-ffi-overhead
+target/release/bench-ffi-overhead
 ```
 
 ## 5. Future work
