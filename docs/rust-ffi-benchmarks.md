@@ -212,7 +212,9 @@ target/release/bench-ffi-overhead
 | プリミティブ `UInt64` (§4b) | ~1.9 ns | サイズ非依存 (定数) |
 | `ByteArray` マーシャル (本節) | 25 ns 〜 14 ms | **O(payload size)** |
 
-「FFI は速い」は **プリミティブ境界に限った話**。データを渡す実運用では、コストは渡すバイト数に線形で、mainnet 規模では STF と肩を並べる。
+「FFI は速い」は **プリミティブ境界に限った話**。データを渡すとコストは渡すバイト数に線形になる。
+
+> **spec スケールでの補正 (§4d 参照)**: 上表の N=10K 以上 (≥586 KB) は `VALIDATOR_REGISTRY_LIMIT = 4096` を超える非物理サイズ。このモデルの payload 上限は V=4096 ⇒ **≤ 240 KB** で、そこでの marshal は **≤ 6.8 µs** = 誤差。「14 ms@57 MB」は到達不能な規模の一般特性であり、実運用 marshal は無視できる。本節の大サイズ行は境界の size-scaling 特性の参考値として残す。
 
 ### 限界
 
@@ -237,48 +239,54 @@ target/release/bench-ffi-marshal
 - **正当性ゲート**: `csf_bench_state_transition_ssz_run` が全 N で sentinel **0 (Ok)** を返すことを assert。誤ったコーデックなら sentinel が変わるかクラッシュするため、これがパイプライン全体の正当性検証になっている。
 - **分解**: marshal = `_marshal_noop`、decode = `_ssz_decode` − marshal、STF = `_ssz_run` − `_ssz_decode`。
 
-### 計測結果
+### V の上限 = 4096 (重要)
 
-| N | payload | marshal | decode | STF | total (e2e) |
+V (validator 数) は **`VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096`** で上限が決まる。これは leanSpec 正準値 (`lean_spec/types/participation.py:11`: `Uint64(2**12)`) であり、`consensus-lean4` の `types.VALIDATOR_REGISTRY_LIMIT` (`Funs/Types.lean`) も同値。`checkpoint_sync` は `validator_count > VALIDATOR_REGISTRY_LIMIT` の state を拒否する。
+
+実運用 V はさらに小さく、**leanSpec のベースラインは 4** (テストは 4/8)。よって計測軸は **devnet baseline (4) → spec 上限 (4096)** とする。
+
+> **訂正**: 本節の旧版は N=100〜1,000,000 で測っていたが、**10,000 以上は spec 上限 4096 を超える非物理値** (mainnet beacon chain の規模を誤って持ち込んだもの)。以下は spec 準拠の軸での再測値。
+
+### 計測結果 (spec-realistic V = 4 … 4096、3 回中央値)
+
+| V | payload | marshal | decode | STF | total (e2e) |
 |---:|---:|---:|---:|---:|---:|
-| 100 | 6.2 KB | 113 ns | 111 µs | 47.6 µs | 159 µs |
-| 1,000 | 58.9 KB | 1.60 µs | 1.06 ms | 83.4 µs | 1.14 ms |
-| 10,000 | 586.3 KB | 20.0 µs | 12.23 ms | 347 µs | 12.60 ms |
-| 100,000 | 5.7 MB | 220 µs | 139.46 ms | 5.05 ms | **144.73 ms** |
+| 4 (devnet baseline) | 0.6 KB | 34 ns | 9.4 µs | 42 µs | **51 µs** |
+| 8 | 0.8 KB | 35 ns | 13 µs | 42 µs | **56 µs** |
+| 64 | 4.1 KB | 86 ns | 71 µs | 48 µs | **119 µs** |
+| 512 | 30.3 KB | 0.8 µs | 555 µs | 60 µs | **615 µs** |
+| 4096 (spec max) | 240.3 KB | 6.8 µs | 4.6 ms | 0.4 ms | **~5.0 ms** |
 
-(N=1M は `--include-1m` で opt-in。decode が ~1.4 µs/validator で線形のため ~1.4 s/call ＋ 数 GB RSS と推定。常用せず。)
+(governor 非固定のため total は 3.3〜5.1 ms の run 間ばらつきあり。decode が支配。)
 
-### 判定 — §4b/§4c の予測を **訂正**
+### 判定
 
-§4c では「実運用 FFI コストの新規項は **marshal**(alloc+memcpy)で、mainnet で STF と肩を並べる」と予測した。**実測はこれを覆した**:
+1. **実運用域では FFI 全経路が無視できる**。devnet baseline (V=4) で e2e **51 µs**、spec 上限 (V=4096) でも **~5 ms**。1 スロット ~数秒の世界で、状態遷移の marshal+decode+STF は誤差。
+2. **小 V では STF が支配、大 V で decode が逆転**。V=4 では STF 42 µs > decode 9 µs (STF の固定コスト)。V≥512 で decode が上回り、V=4096 で decode 4.6 ms / STF 0.4 ms。交差点は V≈64〜512。
+3. **decode コストは List materialize 由来だが上限内では問題化しない**。~1.1 µs/validator (Aeneas の `pubkey : Array Std.U8 52` = 52 ノード list × V)。V=4096 でも 4.6 ms に留まり、spec 上限を超えない限り catastrophic にならない。
+4. **marshal は常に誤差** (≤ 6.8 µs)。payload は V≤4096 で ≤ 240 KB が上限。§4c の「14 ms@57 MB」は V≈1M 相当で **このモデルでは到達不能**。
 
-1. **支配項は marshal ではなく decode**。N=100K で marshal 220 µs に対し **decode 139 ms** —— marshal の **約 630 倍**、STF (5 ms) の **約 28 倍**。memcpy は速い (~26 GB/s、§4c と一致) が、バイト列を **Aeneas の List-backed 型へ materialize する**コストが桁違いに大きい。
-2. **decode は N に線形 (~1.4 µs/validator)** だが定数が巨大。原因は Aeneas 表現: `pubkey : Array Std.U8 52` が **52 要素の連結リスト**で、それが N 個 + `validators : Vec` 自体も List。実データを入れると 1 validator あたり 52 ノードの list 構築が走る。
-3. **STF も §1 より重い** (100K で 5.05 ms vs §1 1.80 ms、~2.8×)。§1 は全 validator が `Array.repeat` の**同一共有オブジェクト**だったが、decode 版は各 validator が**別個のオブジェクト**。実データでは共有が効かず、STF の走査が distinct なキャッシュライン/参照カウントに当たるため。**§1 の 22 ms@1M は共有による楽観値**だった、という重要な含意。
-4. **marshal の相対的軽さが確定**: §4c 単独では「14 ms@1M は無視できない」と見えたが、decode と並べると marshal は誤差。**ボトルネックは一貫して Aeneas の List-backed 表現**で、これは fork-choice の O(B²)(§2)と同一の根本原因。
-
-### この経路の全体像
+### この経路の全体像 (spec 上限 V=4096)
 
 ```
 [Rust bytes] ──①marshal──▶ [ByteArray] ──②decode──▶ [typed State/Block] ──③STF──▶ sentinel
-  serialize       220µs@100K(誤差)      139ms@100K(支配項)        5ms@100K
+  serialize       6.8µs(誤差)        4.6ms(支配項)            0.4ms
 ```
 
-「FFI を実データで使う」コストの正体は **越境でも memcpy でもなく、検証用 Aeneas 型への materialize**。改善は (a) decode 先を Array-backed の高速表現にする、(b) `validators` を flat buffer のまま保持し遅延デコードする、等。issue #4 の本質的課題はマーシャルではなく **decode 表現** にあることが定量的に判明した。
+実運用スケールでは「FFI を実データで使う」コストは全部足しても ~5 ms (最悪)。**真のスケール懸念は validator 軸ではなく blocks 軸** —— fork-choice (§2) の O(B²) で、B は `HISTORICAL_ROOTS_LIMIT = 2^18 = 262144` まで伸びうる。decode/marshal の最適化より `compute_lmd_ghost_head_fast` が優先。
 
 ### 限界
 
 - フラットコーデックで正準 SSZ wire 非互換 (offset/union 等は未対応)。実 devnet テストベクタとの互換は別途。
 - 片道のみ (結果 `State` のエンコード+復路は未計測)。
-- decode 先が List-backed なのは Aeneas 既定。Array-backed への変更で decode/STF とも大きく変わる見込み (future work)。
+- decode 先が List-backed なのは Aeneas 既定。Array-backed への変更で decode はさらに減るが、上限内 (≤5 ms) で既に十分小さい。
 
 ### 再現
 
 ```bash
 cd consensus-lean4 && lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release --bin bench-ffi-ssz
-target/release/bench-ffi-ssz            # N=100..100K
-target/release/bench-ffi-ssz --include-1m
+target/release/bench-ffi-ssz            # V = 4, 8, 64, 512, 4096 (spec range)
 ```
 
 ## 5. Future work

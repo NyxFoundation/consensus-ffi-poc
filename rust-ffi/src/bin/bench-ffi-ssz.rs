@@ -88,8 +88,11 @@ fn serialize_fixture(n: u64) -> Vec<u8> {
 
 // ---- timing ----
 
-const N_AXIS: &[u64] = &[100, 1_000, 10_000, 100_000];
-const REFERENCE_N: u64 = 1_000_000;
+// V is bounded by VALIDATOR_REGISTRY_LIMIT = 4096 (SSZ list cap; Funs/Types.lean).
+// leanSpec baseline is 4 validators; tests use 4/8. This axis spans the real
+// operating range (devnet baseline → spec max), not mainnet-beacon scale.
+const N_AXIS: &[u64] = &[4, 8, 64, 512, 4096];
+const REFERENCE_N: u64 = 4096;
 const TARGET_TRIAL: Duration = Duration::from_millis(200);
 const TRIALS: usize = 11;
 
