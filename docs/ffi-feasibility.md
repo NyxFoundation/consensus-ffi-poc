@@ -1,0 +1,985 @@
+---
+title: Rust ↔ Lean 4 FFI ベンチマーク実現可能性 調査メモ
+last_updated: 2026-05-05
+tags:
+  - ffi
+  - benchmark
+  - aeneas
+  - lean4
+---
+
+# Rust ↔ Lean 4 FFI ベンチマーク実現可能性 調査メモ
+
+## Context — なぜ調査するのか
+
+ユーザー要望: `state_transition.state_transition` と `fork_choice.compute_lmd_ghost_head` を Rust クライアントから FFI 経由で呼び出し、バリデータ数 N を振って実行時間 / メモリを計測したい。
+ガードレール: 「1 行もコードを書く前に」調査メモを承認させること。
+
+調査してわかった**最重要事実**:
+
+1. **同じことをやる 2 つの OPEN PR が既に存在する**。PR #2 (`feat/rust-ffi-poc`) は POC 全体を、PR #3 (`perf/fast-process-attestations`) は Aeneas の O(N²) を 55–134× 高速化する fast path を、既に実装済み。ユーザー決定で**参考資料としてのみ**扱い、実装は独立に行う。
+2. **`compute_lmd_ghost_head` は Validator 数 N を引数に取らない**。シグネチャは `(start_root, blocks, attestations, min_score) → (H256, Vec (H256, U64))`。N ではなく B (blocks) と A (attestations) でスケールする。ユーザーの「N を振る」という計測計画は `state_transition` 側にのみ素直に適用できる (compute_lmd_ghost_head は B, A 軸で計測)。
+3. **生成された `Vec<T>` の実体は `List α` ベース**で push / index が O(n)。`state_transition` 内の `process_attestations` は O(A·N²) で N>2K から実測困難、N=1M で 2 日。**Option X 方式**: `stateTransitionFast` を手書きで組み、`process_slots` / `process_block_header` (Aeneas の線形部分) + handwritten `processBlockFast` (内部で Array ベースの `processAttestationsFast`) + state_root 照合、の全体を 1 FFI コールに畳む。これで N=1M もエントリポイント e2e で実測可能 (~10 s / call 外挿)。
+4. **Aeneas 出力には形式的同値性の証明は付随しない** (Funs/{Types,JustifiedSlots,ForkChoice,StateTransition}.lean は `def` のみで `theorem` なし)。よって slow (Aeneas 版) / fast (手書き版) の選択は純粋に engineering 最適化の話で、検証保証とは独立。本タスクは **slow path ベンチを行わず fast e2e のみ計測**する。
+5. **Lean v4.28.0-rc1 で `precompileModules := true` は避けるべき** (Issue #5509)。PR #2 は `.c.o.export` object を build.rs で動的に拾って static リンクする方式で、これを採用する。
+
+**推奨 (ユーザー 2026-04-24 回答反映)**: PR #2 / #3 は**参考資料として残す**が、実装は**独立した新規ブランチで再作成**する。2 エントリポイント (`state_transition.state_transition`, `fork_choice.compute_lmd_ghost_head`) を**それぞれ 1 FFI コールの e2e で露出** (= Option X) して計測する。slow path の並走は行わない。**入力値は Rust 側で構築し、ToLean trait 経由で `lean_object*` に marshal して FFI で渡す** (= Option II)。将来的な SSZ バイト列方式 (Option III) への移行は別途 GitHub issue で追跡する。本メモは実装計画ではなく**調査報告**であり、実装計画は別途承認を取る。
+
+---
+
+## 1. 先行試行のサーベイ
+
+### 1.1 PR #2 — feat/rust-ffi-poc
+
+| 項目 | 内容 |
+|---|---|
+| ステータス | OPEN, CI 未実行, レビュー未 |
+| サイズ | +920 / −45、10 ファイル |
+| ベース | `main` |
+| head commit | `6ba79a7` |
+
+**追加ファイル**
+- `CLAUDE.md` — アーキテクチャガイド
+- `ConsensusLean4/Ffi.lean` — 14 本の `@[export csf_*]` wrapper
+- `ConsensusLean4/FunsExternal.lean` 編集 — 5 axiom に real def を置換
+- `docs/rust-ffi-benchmarks.md` — 計測方法と結果
+- `rust-ffi/Cargo.toml`, `rust-ffi/build.rs`, `rust-ffi/src/main.rs`
+- `lakefile.lean` に `globs := #[.submodules \`ConsensusLean4]` を追記
+
+**FFI 方式**
+- `extern "C"` raw bindings (cxx / bindgen 不使用)
+- Lean 側 `@[export csf_foo]` → Rust 側 `extern "C" fn csf_foo(...)`
+- 結果を `UInt8` sentinel (0=ok false, 1=ok true, 2=panic, 3=divergence) に pack
+- `build.rs` が `.lake/**/*.c.o.export` を再帰走査し、`Cache/LongestPole/Shake` の Mathlib 付属ツール用 object を除外、`-Wl,--start-group ... --end-group` で static link
+- `libleanshared.so`, `libInit_shared.so`, `libstdc++`, `libgmp` を dylib link、RPATH を toolchain lib dir に設定
+- `precompileModules` 不使用
+
+**露出された Lean エントリポイント**
+- `csf_state_transition_e2e`, `csf_process_slots`, `csf_process_block_header`, `csf_process_attestations`, `csf_process_block`, `csf_slot_is_justifiable_after` + 5 本の build-only twin + 3 本のマイクロベンチ
+- **`compute_lmd_ghost_head` は露出されていない** ← ユーザー要件との差分
+
+**計測値 (PR #2 本文より)**
+- Lean runtime init: ~43 ms (one-shot)
+- Single FFI call `slot_is_justifiable_after`: 320 ns – 5.9 µs
+- 持続スループット: ~92,000 calls/s (1M-call ループで 10.7 µs/call)
+- `Vec.push × N`: N=100 → 91 µs、N=10K → 726 ms、N=20K → 2.97 s (**明らかな O(N²)**)
+
+**既知の制約**
+- Aeneas `Vec` → `List` 翻訳による O(N²) が根本問題。PR #2 単独では Ethereum scale infeasible
+- axiom `alloc.vec.Vec.clear`, `alloc.vec.Vec.is_empty` は残置 (runtime panic の可能性あり)
+- Aeneas 再生成時のパッチ自動化は未整備 (deferred)
+- CI 未走行
+
+**流用判断: 部分流用 (harness, build.rs, Ffi.lean, docs は丸ごと使える)**
+
+---
+
+### 1.2 PR #3 — perf/fast-process-attestations
+
+| 項目 | 内容 |
+|---|---|
+| ステータス | OPEN, PR #2 の上にスタック |
+| サイズ | +339 / 0、4 ファイル |
+| ベース | `feat/rust-ffi-poc` |
+| head commit | `1e10fe6` |
+
+**差分**
+- `ConsensusLean4/FastPath.lean` (新規 207 行) — `Vec` ↔ `Array` コンバータ + `isValidVoteFast` + `processSingleAttestationFast` + `serializeJustificationsFast`
+- `ConsensusLean4/Ffi.lean` に `@[export csf_process_attestations_fast]` wrapper を追加
+- `rust-ffi/src/main.rs` に fast path FFI decl + slow/fast parity check
+- `docs/rust-ffi-benchmarks.md` に fast-path section を追加
+
+**アルゴリズム**
+- 入口で `Vec` → `Array` に O(V) 変換
+- `justifications_validators` (flat `Vec Bool`) を `Array (H256 × Array Bool)` に unflatten
+- per-attestation の各ステップを Array 操作 (O(1) index, O(V) scan) で置換
+- 2/3 閾値達成時は slow path に bail (try_finalize の副作用を保持)
+- 出口で Array → `Vec` に O(V) 変換
+
+**計測値 (paired delta, release build)**
+
+| V | A | slow (ms) | fast (ms) | speedup |
+|---:|---:|---:|---:|---:|
+| 500 | 16 | 31.70 | 1.57 | 20× |
+| 500 | 64 | 135.35 | 6.13 | 22× |
+| 1,000 | 16 | 140.32 | 2.75 | 51× |
+| 1,000 | 64 | 780.21 | 10.29 | 76× |
+| 2,000 | 16 | 796.89 | 5.96 | **134×** |
+| 2,000 | 64 | 2,670 | 20.51 | 130× |
+
+slow の per-(V²·A) 定数 ≈ 10 ns (二次性の証拠)、fast の per-(V·A) 定数 ≈ 160 ns。
+この係数で外挿すると V=1M は slow ~2.2 日、fast ~数秒 / block。
+
+**既知の制約**
+- `processAttestationsFast_eq_slow` の形式的同値性証明は未完了 (parity check は実行時のみ)
+- `hash_tree_root_*` は stub のまま (crypto cost ゼロ → 絶対時間は過小評価)
+- aggregation_bits all-false 条件下の測定なので index_mut write path 未検証
+
+**流用判断: 丸ごと採用**
+
+---
+
+### 1.3 Issue / 関連 PR
+
+- `gh issue list` → 空。実際の issue は 0 件。README 表示の `open_issues_count` は PR カウントを含む GitHub 仕様のため。
+- parent/source なし (fork ではない独立リポジトリ)
+
+---
+
+## 2. 2 エントリポイントの計算量と実行可能性の上限
+
+### 2.1 `state_transition.state_transition` (`Funs/StateTransition.lean:1356`)
+
+```
+state_transition (state, block)
+├── process_slots state block.slot
+│   ├── extend_to_slot (per-slot)
+│   └── hash_tree_root_state  [STUB → ZERO]
+└── process_block state block
+    ├── process_block_header  (O(1) 程度)
+    └── process_attestations  ← O(A·N²) の主ボトルネック
+        ├── process_attestations_loop0 (A iterations)
+        │   ├── _loop0_loop0_loop0  [N × J × N]
+        │   ├── _loop0_loop1_loop0  [historical × O(V) lookup]
+        │   └── _loop0_loop2        (vote tally)
+        └── serialize_justifications  [R × J × N 3 重ループ]
+```
+
+**計算量** (Vec が List バックのとき):
+- `process_attestations`: **O(A · N²)** が支配項 (PR #3 計測で係数 10 ns/(V²·A))
+- `serialize_justifications`: O(R · N) (R ≤ 10 で実質線形)
+- `process_slots`: O(S) (slots 数)
+- **全体**: O(A·N²) が支配。fast path 適用で **O(A·N)**
+
+### 2.2 `fork_choice.compute_lmd_ghost_head` (`Funs/ForkChoice.lean:991`)
+
+シグネチャ:
+```lean
+(start_root : H256)
+(blocks : Vec (H256 × (U64 × H256)))
+(attestations : Vec (U64 × AttestationData))
+(min_score : U64)
+→ Result (H256 × Vec (H256 × U64))
+```
+
+**N はパラメータに現れない**。スケールするのは:
+- A = attestations 数 (外側ループ)
+- B = blocks 数 (内側 tree traversal)
+
+**ループ構造**:
+```
+compute_lmd_ghost_head
+├── compute_lmd_ghost_head_loop0/4   [B iterations, min-slot block 探索]
+├── compute_lmd_ghost_head_loop1     [B iterations, start_root 照合]
+├── compute_block_weights            ← O(A · B²)
+│   └── compute_block_weights_loop0
+│       └── _loop0_loop0_loop0 (B)    [weights vec search O(B)]
+├── compute_lmd_ghost_head_loop2/5   [children_map 構築 O(B)]
+│   └── get_weight (O(B) lookup on weights Vec)   ← O(B²)
+└── compute_lmd_ghost_head_loop3/6   [tree traversal O(B·max_children)]
+```
+
+**全体**: **O(A · B²)**。N に依存しないが、B (ethereum mainnet で ~32K) で二次。
+
+**ユーザー要件との重要な不整合**:
+ユーザーは「バリデータ数を振って計測」と書いているが、`compute_lmd_ghost_head` で N を振っても`weights` Vec の**値**が変わるだけで**計算量**は変わらない。計測するなら **B と A を振る**のが正しい。メモ承認後にユーザー意図の確認が必要。
+
+### 2.3 Aeneas `alloc.vec.Vec` の実体 (rev 864eddb4)
+
+GitHub raw (`Aeneas/Std/Vec.lean`) を取得して確認:
+
+```
+Vec α := { l : List α // l.length ≤ Usize.max }
+```
+
+| 操作 | 漸近コスト |
+|---|---|
+| `new` | O(1) |
+| `len` | O(1) (キャッシュ長) |
+| `index i` | **O(i)** (List 走査) |
+| `index_mut i` | **O(i)** |
+| `push x` | **O(n)** (`List.concat`) |
+| `clear` | axiomatized (FunsExternal) |
+| `is_empty` | axiomatized (FunsExternal) |
+
+`@[extern ...]` による C 実装差し替えは**なし**。純粋 Lean。PR #3 の fast path はこれを Lean ネイティブ `Array` (mutable underlying、O(1) index、amortized O(1) push) にコピーして回避している。
+
+### 2.4 実測可能スケール階段 (Option X 前提)
+
+**方針**: 本タスクでは slow path (Aeneas 出力そのまま) の計測は**行わない**。代わりに:
+- **state_transition**: handwritten `stateTransitionFast` を N 軸で計測 — 内部で `processAttestationsFast` を呼ぶ e2e 1 FFI コール
+- **compute_lmd_ghost_head**: Aeneas 出力をそのまま 1 FFI コールで呼び、B, A 軸で計測 (N は内部パラメータ)
+- 実測値がないセルは**外挿**と明示。PR #3 の `process_attestations_fast` 単独計測値から e2e を外挿する
+
+#### state_transition e2e (A=64 固定)
+
+| N | 根拠 | 時間 (1 block, 外挿) |
+|---:|---|---:|
+| 100 | PR #3 fast 係数 ~160 ns/(V·A) | ~1 ms |
+| 1,000 | 〃 (PR #3 単独で 10.29 ms、e2e はそれ + process_slots/header 分) | ~10 ms |
+| 10,000 | 〃 | ~100 ms |
+| 100,000 | 〃 | ~1 s |
+| 1,000,000 | 〃 (hash_tree_root stub 前提で過小評価の可能性) | ~10 s |
+
+**注**: 上記は PR #3 の `process_attestations_fast` 単独値を「state_transition 全体の支配項」と仮定した外挿。実装後の実測で以下を確認する必要あり:
+- process_slots (slot 進行 + 2 回の hash_tree_root_state stub) の実コスト
+- process_block_header のチェック 3 件
+- state_root 最終比較 (hash_tree_root_state × 1)
+- 上記が process_attestations を覆すのは hash_tree_root が real 実装になったときのみで、stub のままなら process_attestations が支配的
+
+#### compute_lmd_ghost_head e2e (Aeneas 出力そのまま)
+
+| B | A | 複雑度 A·B² | 時間 (外挿、Vec=List ベース、実測なし) |
+|---:|---:|---:|---:|
+| 100 | 32 | 3·10⁵ ops | ~100 µs |
+| 1,000 | 32 | 3·10⁷ ops | ~10 ms |
+| 10,000 | 32 | 3·10⁹ ops | ~1 s |
+| 32,000 | 128 | 1.3·10¹¹ ops | ~100 s ← 要 fast path (**本タスクでは対象外**) |
+
+compute_lmd_ghost_head は **N 非依存**。Aeneas 出力は O(A·B²) なので、**本タスクのデフォルトは B ≤ 10K で打ち止め** (mainnet 級 B=32K は追加で `compute_lmd_ghost_head_fast` を書く必要があり、別スコープ)。
+
+> 注: 計算量の authoritative 記述は [`ConsensusLean4/Ffi.lean#L61`](../ConsensusLean4/Ffi.lean#L61) (`linear in attestations, quadratic in blocks`) および [`docs/timing-budget.md`](./timing-budget.md) §6 を参照。本セクションの `O(A·B²)` 表記は経験的外挿の根拠付けであり、形式的解析ではない。
+
+#### 理論下限 (参考、計測しない)
+
+slow path (= Aeneas 出力そのまま) の state_transition は O(A·N²) で、N=10K で 64 s、N=1M で ~2.2 日。**これを測る意義はないので計測しない**が、「なぜ Option X が必要か」の根拠として記録しておく。
+
+---
+
+## 3. ビルド系の実例と制約
+
+### 3.1 Lake の output 構造
+
+- `.lake/build/lib/`: `.olean`, `.ilean`、`:static` で `.a`
+- `.lake/build/ir/`: `.c`, `.c.o.export`, `.c.o.noexport`
+- `@[export name]` で unmangled C シンボルが `.c.o.export` に出力される
+
+### 3.2 precompileModules の取り扱い
+
+- `precompileModules := true` は各モジュールを `.so` に事前コンパイル → interpreter を高速化
+- **Issue #5509**: precompileModules + `@[extern]` で undefined symbol を起こすケースが報告されている
+- **Mathlib + precompileModules**: Issue #9420 (Linux), #7917 (macOS) の存在
+- **v4.28.0-rc1 固有のレグレッション**: 公開 issue には見つからず (但し RC なので未検証領域あり)
+- **PR #2 は precompileModules を使わない**方式 (build.rs が `.c.o.export` を static リンク) を選択しており、これは堅い選択
+
+### 3.3 libleanshared.so の扱い
+
+- `~/.elan/toolchains/leanprover-lean4-v4.28.0-rc1/lib/libleanshared.so` を dynamic link するのが標準
+- Lake は `.lake/build/lib/` に copy しない → consumer 側の build.rs で `cargo:rustc-link-search=native=<toolchain-lib>` と `rustc-link-lib=dylib=leanshared` を指定
+- Runtime は `LD_LIBRARY_PATH` か `-Wl,-rpath=<toolchain-lib>` を使用 (PR #2 は rpath 埋め込み)
+- `lean_initialize_runtime_module()` → `lean_initialize()` → `initialize_<pkg>()` の順序は必須
+
+### 3.4 実例
+
+| プロジェクト | 方式 | コメント |
+|---|---|---|
+| leanprover/lean4 `src/lake/examples/reverse-ffi/` | static + `@[export]` | 公式最小例 |
+| lurk-lab/RustFFI.lean | static link from Rust | Rust → Lean の典型 |
+| DSLstandard/Lean4-FFI-Programming-Tutorial-GLFW | `extern_lib` + C | FFI 学習向け |
+| tydeu/lean4-alloy | Lean-in-C shim | 高機能だが学習コスト |
+
+---
+
+## 4. 推奨アプローチと代案
+
+**ユーザー決定 (2026-04-24)**: PR #2 / #3 は参考資料として残し、独立ブランチで再実装する。よって推奨は下記 Option A (新規ブランチ) に確定。
+
+### 4.1 推奨 (Option A + Option X): 新規ブランチで独立実装、2 エントリポイントを e2e で露出
+
+**Option X の定義**: 2 エントリポイント (`state_transition`, `compute_lmd_ghost_head`) を**それぞれ 1 FFI コール**で e2e 実行させる。state_transition 側は Aeneas 出力のままだと O(A·N²) で実測不能なので、handwritten `stateTransitionFast` を用意して `processAttestationsFast` を内部で呼ばせる。compute_lmd_ghost_head 側は Aeneas 出力をそのまま呼ぶ (B ≤ 10K 前提)。
+
+**入力構築モデル (Option II)**:
+- Rust 側に `State` / `Block` / `Validator` / `H256` / `Vec<T>` 等の Rust 構造体を定義 (Aeneas 出力の Lean type と対応)
+- 各型に `ToLean` trait 実装を書き、`lean_alloc_ctor` / `lean_box_*` / `lean_mk_string` 等で `lean_object*` を構築
+- Rust 側で State/Block を組み立てて marshal 完了 → timer 開始 → FFI call → timer 終了、の順で計測するので **marshal コストは計測外**
+- `build_state_lean(n, a, seed)` のような helper を Rust 側に用意 (決定的構築)、これはベンチループ前に 1 回呼ぶ
+- **将来 Option III (SSZ バイト列) への移行時**: Rust の `ToLean` impl を捨てて `ssz_encode → bytes` に置換、Lean 側に SSZ decoder を追加する。issue で追跡
+
+**露出する FFI シンボル (2 本 + no-op twin 2 本)**:
+| シンボル | シグネチャ (Rust 側) | 中身 | 軸 |
+|---|---|---|---|
+| `csf_state_transition` | `(state: *mut lean_object, block: *mut lean_object) -> u8` | handwritten `stateTransitionFast` 全体 | N (A=64 固定) |
+| `csf_state_transition_noop` | 同上 | 入力を受けて pipeline を回さず即 return (FFI 境界コストの twin) | 同上 |
+| `csf_compute_lmd_ghost_head` | `(start_root, blocks, atts, min_score: *mut lean_object) -> *mut lean_object` | Aeneas `fork_choice.compute_lmd_ghost_head` | B, A |
+| `csf_compute_lmd_ghost_head_noop` | 同上 | 入力を受けて pipeline を回さず即 return | 同上 |
+
+twin の目的: `lean_inc`/`lean_dec` など FFI 境界自体の ~320 ns オーバーヘッドを測り、paired-delta で差し引いて pure pipeline cost を出す。
+
+**handwritten Lean 側の構造** (`ConsensusLean4/FastPath.lean` 相当、ゼロから再実装):
+```
+stateTransitionFast : State → Block → Result (Result Unit Error × State)
+├── process_slots (Aeneas 出力そのまま、線形)
+├── process_block_fast
+│   ├── process_block_header (Aeneas 出力そのまま、定数時間)
+│   └── processAttestationsFast (Array ベースの手書き、PR #3 参照)
+└── hash_tree_root_state 照合
+```
+
+`compute_lmd_ghost_head` は手書きせず、Aeneas 出力 (`Funs/ForkChoice.lean:991` の定義) をそのまま `@[export]` 経由で呼ぶ。
+
+**骨子** (本メモ承認後、別途「実装計画」として再承認を取る):
+1. 新規 feature branch (例: `feat/ffi-benchmarks`) を `main` から切る (現 main HEAD `220e01a`、Funs.lean は PR #17 で 4 サブモジュール `Funs/{Types, JustifiedSlots, ForkChoice, StateTransition}.lean` に分割済)
+2. `ConsensusLean4/FunsExternal.lean` の 5 axiom に real def を追加
+3. `ConsensusLean4/FastPath.lean` (新規、top-level、`Funs.lean` umbrella と同階層) に `processAttestationsFast` + `processBlockFast` + `stateTransitionFast` を実装。`process_slots` / `process_block_header` は `Funs/StateTransition.lean` 内、`hash_tree_root_state` は `Funs/Types.lean` 内 (いずれも transitive import 経由で取得) — PR #3 のアルゴリズムを参考にコードはゼロから書き直し
+4. `ConsensusLean4/Ffi.lean` (新規、top-level) に `@[export]` wrapper 4 本を定義 (pipeline wrapper 2 本 + noop twin 2 本)。`compute_lmd_ghost_head` は `Funs/ForkChoice.lean:991` の Aeneas 出力を直接呼ぶ
+5. `lakefile.lean` は現 9 行据置で OK (`precompileModules` 不設定 = default false で Issue #5509 回避、`globs := #[.submodules \`ConsensusLean4]` も不要 = root の `import` で transitive 解決)
+6. `rust-ffi/` crate を**ゼロから**作成:
+   - `src/lean_types.rs`: `State` / `Block` / `Validator` / `H256` / `Checkpoint` / `AggregatedAttestation` 等の Rust 構造体定義
+   - `src/to_lean.rs`: `ToLean` trait 定義 + 各型の impl (`lean_alloc_ctor` / `lean_box_u64` / `lean_mk_empty_array` 等の FFI 呼び出し)
+   - `src/ffi.rs`: `extern "C"` ブロックで 5 個の Lean 側関数 (`csf_ping` + 4 本) を宣言
+   - `src/bench/{state_transition.rs, fork_choice.rs}`: 2 エントリポイント別の bench バイナリ
+   - `build.rs`: `.c.o.export` を動的スキャンして static link、`libleanshared.so` を dylib link、RPATH 埋め込み
+7. Smoke test 3 段階 (セクション 7) を最初のマイルストーン
+8. N 軸ベンチ: state_transition を `cargo run --release --bin bench-state-transition` で N=100, 1K, 10K, 100K (1M はオプション)
+9. B, A 軸ベンチ: compute_lmd_ghost_head を `cargo run --release --bin bench-fork-choice` で B=100, 1K, 10K × A=32/128
+10. 結果を `docs/rust-ffi-benchmarks.md` (または別名) に書く
+11. 完了後、PR #2 / #3 の扱いはユーザー判断
+12. **別途 issue 発行**: Option III (SSZ バイト列移行) のトラッキング issue を作成 (本メモ承認直後、plan mode 終了後に実施)
+
+**採用理由**:
+- ユーザー意向: 既存 PR の設計を再検証したい
+- 設計判断 (wrapper 分割粒度、build.rs の object 走査範囲、fast path のデータ構造) を本タスクで能動的に選べる
+- compute_lmd_ghost_head を最初から含む一貫したベンチ設計が可能
+
+**リスク / 留意点**:
+- **二重実装コスト**: PR と同じ trap に引っかかりうる (Aeneas O(N²), axiom panic, precompileModules Issue #5509 など) → 本メモのセクション 6 (既知制約) を事前チェックリスト化する
+- **PR との並存**: 同一 repo に 3 本の feature branch が open になる。本ブランチ側の変更が `ConsensusLean4/FunsExternal.lean` に触れると PR #2 とマージ衝突する。どちらを正にするかを初期に決める必要あり (セクション 8 の Q5 追加)
+
+**Option A で「参考はしても copy はしない」ラインの具体化**:
+
+| 項目 | PR から copy する | 仕様 / 知見のみ参照 |
+|---|---|---|
+| FFI 初期化順序 (`lean_initialize_runtime_module` → `lean_initialize` → `initialize_...`) | ー | ✓ (Lean 公式 FFI docs が一次ソース) |
+| build.rs の object 走査方針 | ー | ✓ (`.c.o.export` を拾う、Mathlib tooldir 除外) |
+| `@[export csf_*]` 命名規則 | ー | ✓ (衝突回避の prefix アイデアとして) |
+| 結果の UInt8 sentinel 設計 | ー | ✓ (0/1/2/3 の意味付けは再決定してよい) |
+| FastPath の `Vec` ↔ `Array` 変換アルゴリズム | ー | ✓ (アルゴリズムは同じものを再実装) |
+| paired-delta 計測手法 | ー | ✓ (手法として採用、コードは書き直し) |
+
+### 4.2 代案 B: PR #2 / #3 を main にマージしてその上に積む (2026-04-24 見送り)
+
+**見送り理由 (ユーザー決定)**: 設計判断を再検証したい。初期投資を再支払いしてでも。
+
+### 4.3 代案 C: criterion でマイクロベンチのみ、FFI はやらない
+
+**見送り理由**: 「Rust から FFI 経由で呼ぶ」がユーザー要件なのでスコープ逸脱。Lean 側でも `IO.monoMsNow` で測ると元々 possible。
+
+### 4.4 代案 D: cxx / bindgen を使う
+
+**見送り理由**: Lean が generate する C コードは ABI が `extern "C"` 準拠なので raw FFI で十分。cxx は C++ ABI で複雑化するだけ。bindgen も自動 header 生成の利点が小さい。
+
+---
+
+## 5. 計測方法
+
+### 5.1 時間計測
+
+- **推奨**: PR #2 既存方式 (`std::time::Instant` + paired-delta、build-only twin を back-to-back で引き算して construction cost を除去)。Criterion.rs は warmup と統計が強力だが paired-delta 技法と重複する。compute_lmd_ghost_head の計測追加時は criterion の `iter_batched` を使う手もある (blocks Vec 構築コストを除外するため)。
+- Lean 側の `IO.monoMsNow` は ms 粒度なので短時間計測には向かない。Rust 側の計時を正とする。
+- Lean runtime init (~43 ms) はベンチループ外で一度だけ実施。
+
+### 5.2 メモリ計測
+
+- **推奨**: Linux で `getrusage(RUSAGE_SELF)` から `ru_maxrss` を取る (Rust では `libc` crate)。
+- **重要**: `ru_maxrss` はプロセスライフタイム全体の peak を返すため、**2 エントリポイントは別プロセスで独立に計測する**必要あり (§9 参照)。同一プロセス内で state_transition → compute_lmd_ghost_head の順に走らせると、後者の RSS には前者の peak が混入する。
+- `memory-stats` crate も同等だが依存が増えるだけなので必要性薄。
+- Lean ヒープの内部状態は `lean_ref_count` などで直接取れるが、**プロセス全体の RSS** のほうがユーザーが知りたい値に近い。
+- 補足: `valgrind --tool=massif` は絶対ヒープピークを精緻に取れるが FFI 初期化を含めた測定で時間がかかるため、最大セル (N=100K や B=10K, A=128) のみ別プロセスで補足計測する運用がよい。
+
+### 5.3 再現性
+
+- release build (`cargo build --release`) で計測
+- CPU governor を performance、`taskset -c <core>` でピン止め、ハイパースレッドの影響を減らす
+- 各 (N, A, B) cell は 5 試行以上、中央値 + IQR を記録
+
+---
+
+## 6. 既知の制約 (列挙)
+
+| # | 制約 | 影響 | 対応 |
+|---|---|---|---|
+| C1 | Aeneas `Vec` が `List α` backing → O(N²) | Aeneas 出力そのままの state_transition は N>2K で実測困難 | handwritten `stateTransitionFast` (Option X) で回避、slow path は計測対象外 |
+| C2 | `hash_tree_root_*` が `ZERO` を返す stub | 絶対時間を過小評価 (SSZ hashing ~10-100 µs/State が欠落) | 「実 consensus では + X% 遅い」と注記 |
+| C3 | axiom `Vec::clear`, `Vec::is_empty`, `Ordering.eq`, `Result.branch`, `Result.from_residual` | 未実装で runtime panic の可能性 | M2 で real def に置換 |
+| C4 | aggregation_bits 全 false で計測 → index_mut write path 未検証 | worst case 時間が未知 | seed で aggregation_bits を一部 true にするテストを別途 |
+| C5 | 署名検証なし (BLS なし) | 実 consensus より軽い | 注記のみ。導入は別スコープ (詳細は §6.1) |
+| C6 | precompileModules + `@[extern]` の Issue #5509 | 特定構成で linker error | `precompileModules := false` を維持 |
+| C7 | Mathlib サイズ (Aeneas 経由で pull) | リンク時間 / バイナリサイズが大きい | build.rs で不要 object を除外 (PR #2 既存) |
+| C8 | compute_lmd_ghost_head のベンチは未計測 | ユーザー要件未達 | Option A の手順 3–4 で追加 |
+| C9 | `try_finalize_loop1_loop0` など他の O(?·N) 候補 | PR #3 fast path 対象外 | 計測して必要なら追 fast path |
+| C11 | lean-toolchain は v4.28.0-rc1 (RC) | 現行バージョンで固定、本タスクで upgrade しない | **toolchain 変更は本メモとは別に単独承認** |
+| C13 | Option II は marshal cost を計測外に置く設計 | 実 client の "Rust から Lean に State を渡す総コスト" とは別物になる | timer の置き方を明示、marshal 別途計測用の cell も用意 (`*_noop` twin) |
+
+(旧 C10 / C12 「Aeneas 再生成関連」は削除。本タスクで Aeneas を再走行しない以上、hypothetical future 対応は不要。ユーザー指摘 2026-04-24。)
+
+### 6.1 C5 詳細: 署名検証の位置づけと Rust 連携モデル (参考)
+
+本プロジェクトでは BLS 署名検証を組み込まないが、**実 consensus client で組み込むとしたらどうなるか**の整理を残しておく。将来 spec 拡張を検討するときの参照用。
+
+#### spec 上どちらのエントリポイントに含まれるか
+
+- **state_transition 側が主担当**。Ethereum consensus の実 spec では `state_transition` (特に `process_block` 経路) で全ての block 内署名を verify する:
+  - Block proposer 署名 (`process_block_header` 内)
+  - 集約 Attestation 署名 (`process_attestations` 内、BLS12-381 集約)
+  - Altair+ では sync committee 署名、Deposit 署名、Voluntary exit 署名、Proposer/Attester slashing の各署名
+- **compute_lmd_ghost_head (fork_choice) は signature を verify しない**。前提として入力 attestations は**事前に attestation pool で verify 済**。fork choice は pure な graph / weight 計算に専念する ("pre-verified attestation pool" モデル)
+- 3SF-mini の Aeneas 生成コードでも fork_choice 側には signature 関連の logic は**存在しない**
+
+#### Rust 側 BLS 実装を連携させる 3 つの設計モデル
+
+現実の consensus client は BLS 実装 (例: `blst`, `milagro_bls`, `bls12_381`) を Rust で持つのが一般的。仮に本プロジェクトで連携するなら:
+
+**α. Lean から Rust の BLS 関数を `@[extern]` で呼び返す**
+```lean
+@[extern "consensus_bls_verify"]
+axiom consensusBlsVerify : @& ByteArray → @& ByteArray → @& ByteArray → Bool
+  -- pubkey / signature / message
+```
+```rust
+#[no_mangle]
+extern "C" fn consensus_bls_verify(pk: *const u8, sig: *const u8, msg: *const u8) -> u8 {
+    // blst の verify を呼ぶ
+}
+```
+Lean 側の `process_attestations` 等で `consensusBlsVerify` を呼ぶ。**問題**: attestation 数 × FFI 境界 = 大量の callback で境界コストが累積。1M validators × 複数 attestations のベンチに耐えない。
+
+**β. Rust 側で事前 verify、Lean には検証済入力のみ渡す (推奨される整合的モデル)**
+- Rust 側で block を受け取り、BLS verify を先に済ませる
+- verify OK → Lean に state/block を marshal (現行 Option II の拡張) → FFI 呼び出し → state 更新
+- verify NG → Lean を呼ばず reject
+- **Lean 側は signature を触らない**: spec 側の純粋さが保たれる
+- 現実の consensus client (Lighthouse, Prysm, Teku など) はすべて**この分担**で動いている
+
+利点:
+- 関心の分離 (cryptography は Rust、semantics は Lean)
+- FFI 境界は block 単位 (attestation 毎の境界跨ぎなし)
+- Lean の formalization target から BLS を exclude できる (証明対象を狭く保てる)
+
+**γ. Rust / Lean 両方で dual verify (研究用)**
+- 同じ署名を 2 重 verify、トラストモデル研究の題材
+- 実用価値低い (コスト重複、メリット薄)
+
+#### 結論
+
+- 本プロジェクトの FFI ベンチでは BLS は**組み込まない** (C5 通り)
+- もし将来組み込むなら **β モデル**が標準: Rust が gate-keeper として事前 verify、Lean は verify 済入力を受けて state を進める
+- Lean spec 側に BLS を入れる動機はない (Aeneas 形式化の対象を consensus semantics に絞るため)
+- spec の `process_attestations` / `process_block_header` に書かれている "signature verify" ステップは、**β の場合 Rust 側で先取り実行されるスキップ相当**として扱う
+
+---
+
+## 7. Smoke test — 3 段階で e2e まで通す
+
+Option X では smoke を 3 ステップに分割し、FFI 境界 → e2e ベンチ対象の順に段階検証する:
+
+### Stage 1: `csf_ping` — FFI 往復の最小確認
+
+```lean
+@[export csf_ping] def csfPing (n : UInt64) : UInt64 := n + 1
+```
+```rust
+extern "C" {
+  fn lean_initialize_runtime_module();
+  fn lean_initialize();
+  fn initialize_<pkg>(b: u8, w: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+  fn csf_ping(n: u64) -> u64;
+}
+assert_eq!(csf_ping(41), 42);
+```
+
+**通すべき項目**: `lake build :static` 成功、`nm` でシンボル可視、`cargo build` がリンクエラーなし、実行が exit 0。
+
+### Stage 2: `csf_state_transition` — エントリポイント 1 本目 e2e
+
+最小入力 (validators=2、attestations=1、blocks=1) を **Rust 側で構築し `ToLean` で `lean_object*` に marshal** してから、1 FFI コールで `stateTransitionFast` を呼ぶ。
+
+**通すべき項目**:
+- Rust 側で構築した State/Block が Lean 側で正しく復元されている (小さい cell で Lean 側に debug print を仕込むか、noop twin で lean_inc/lean_dec を通すだけで panic しないことを確認)
+- `csf_state_transition(state_obj, block_obj) == OK sentinel (1)` を確認
+- 入力を一か所壊した (例: block.slot を不正に) 場合に Err sentinel を返すこと
+- runtime panic が発生しないこと (FunsExternal の axiom 残置時に panic する可能性への網)
+
+### Stage 3: `csf_compute_lmd_ghost_head` — エントリポイント 2 本目 e2e
+
+最小入力 (blocks=3、attestations=2) を Rust 側で構築し ToLean で marshal、1 FFI コールで Aeneas の `compute_lmd_ghost_head` を呼ぶ。
+
+**通すべき項目**:
+- 返り値の (head_root, weights) が期待値と一致
+- blocks=[] (空) で `start_root` を素通しで返すエッジケースも確認
+
+Stage 1→2→3 のいずれかで失敗した場合、ベンチフェーズには進まない。
+
+---
+
+## 7.1 予見できる問題 (追加分、P1-P16 に続く)
+
+2026-04-24 の事前検証で PR #2 の実ソース (Ffi.lean, FunsExternal.lean, lakefile.lean, build.rs) と Types.lean の State 構造を読み直し、以下の追加問題を発見・整理した。ユーザーが P1/P2/P9/P12/P13/P14/P15/P16 を許容宣言済のため、それ以外で対処すべきもの。
+
+### 設計レベルの問題
+
+**P11 (解決方針確定 2026-04-24): 実践的 block-building への拡張は future work**
+
+現プランは「各 bench iteration で genesis state から 1 block 分 state_transition を呼ぶ」。理想的には **state chain (genesis → block1 → state1 → block2 → state2 → …)** で、Rust 側が State の `lean_object*` を保持・連鎖させる運用。
+
+ユーザー決定: 理想形は将来の改善に回し、本タスクでは現プランで進める。[issue #6](https://github.com/NyxFoundation/consensus-lean4/issues/6) で追跡。
+
+必要な追加実装 (issue 化する範囲):
+- `csf_state_transition` の戻り値を UInt8 sentinel から `lean_object*` (新 State を指す) に変更するか、out-param で State を返す
+- Rust 側で State を持ち続けるための RAII 的ラッパー (`LeanObj<State>`)
+- N block 分 chain する bench harness (追加のベンチ軸)
+- P29 (dec_ref discipline) と連動した運用
+
+**(c) Bench ループ内の state 使い回し判断 — Option A 確定 (2026-04-24)**
+
+ユーザー決定: **毎 iter rebuild、同じ contents を新規 alloc** (Option A、下記 A15 参照)。
+
+理由:
+1. FBIP の fast path (refcount=1 → in-place mutation) を踏めるので pipeline 内部の更新が O(1)
+2. marshal コストは timer 外で完結、timer 内は純粋 pipeline + FFI 境界コスト
+3. Lean が input を consume するので Rust 側 dec_ref 規律不要 (P29 解消)
+4. 毎 iter 同じ seed から deterministic に構築 → 再現性 + 分散を median+IQR で抑制
+5. 真の block-chain 動作は P11 (future work、別 issue) で扱う、本タスクと scope 分離
+
+**波及する副次的な解決**:
+- P7 (戻り値設計) → UInt8 sentinel で確定 (A16)
+- P29 (dec_ref discipline) → Rust 側に規律不要で確定 (A17)
+
+**P17 (解決済、A8 で Option II 確定)**
+
+A8 で Option II (Rust 側 ToLean marshal) を採用決定。PR #2 が Option I を採ったのは実装量を下げるためだが、本タスクは「Rust から入力を渡す realistic workflow」を重視して Option II を選択している。工数が多いのは承知、P19 / P20 / P23 はその下流作業として処理する。
+
+（旧記述: Option II の重さを警告して prototype を先に作る案を挙げていたが、ユーザー指示 2026-04-24 で不要と確認。）
+
+**P18. 現在の `main` は axiom のままで non-runnable** → **A20 で解決** (2026-04-24)
+
+決定: M2 を M3 の hard prereq に昇格、5 axiom 全部置換 (M0 → M1 → M2 → M3 → M4 → M5 の順)。A5 は「5 axiom だけ置換して新規追加しない」の diff 最小化として解釈更新。
+
+**P19. `alloc.vec.Vec` の proof を Rust から構築できない** → **A23 revised で解決** (2026-04-24)
+
+当初は Lean 側に Marshal.lean を作って per-type helper で proof を構築する案を立てたが、ユーザー指摘: Aeneas は formal proof を生成しない (Funs/{Types,JustifiedSlots,ForkChoice,StateTransition}.lean は `def` のみ、`theorem` なし)。runtime では Lean の proof irrelevance により `Vec.property` は `lean_box(0)` に erase される。
+
+→ **proof 構築は不要**。Rust が Vec の ctor layout (tag 0, 2 obj fields: `val`, `property`) を直接組み立て、`property` 側には `lean_box(0)` を入れるだけで runtime 的に有効な Vec になる。Marshal.lean は作らない。
+
+**P20. Rust 側 `List α` 構築は再帰 `lean_alloc_ctor` 呼び出し** → **A24 で解決** (2026-04-24)
+
+決定: Rust 側 `to_lean.rs` に `lean_list_nil()` / `lean_list_cons(head, tail)` / `list_from_iter(items, to_lean)` を実装。iter.rev() + cons で正順 List を構築。N=1M で ~100-200 ms (timer 外)。
+
+### 実装・ビルドレベルの問題
+
+**P21. `build.rs` の `rerun-if-changed` が不十分** → **A21 で解決** (2026-04-24)
+
+決定: `build.rs` / `../ConsensusLean4/` (dir 全体) / `../lakefile.lean` / `../lean-toolchain` / `../lake-manifest.json` を watch。
+
+**P22. `lake build` と `cargo build` の依存が宣言されていない** → **A22 で解決** (2026-04-24)
+
+決定: build.rs が `Command::new("lake").arg("build").current_dir("..")` を自動 invoke。冪等 (cache 効けば ~1s)。README で elan / lake 必要性明記。
+
+**P23. `lean_object *` の所有権コンベンション** → **A25 で解決** (2026-04-24)
+
+決定: owned / single-use convention。Rust が FFI に渡した pointer は即座に無効扱い。Option A では Lean が consume して戻り値は UInt8 なので、`lean_inc_ref` / `lean_dec_ref` は Rust 側で一切呼ばない。
+
+**P24. Aeneas の `Result` 2 重構造 (Aeneas monad × Rust enum)**
+
+`state_transition : State → Block → Result (core.result.Result Unit Error × State)`。PR #2 の `packPipeline` は:
+```
+match r with
+| Result.ok (core.result.Result.Ok _,  _) => 0   -- 正常
+| Result.ok (core.result.Result.Err _, _) => 1   -- spec 内エラー
+| Result.fail _ => 2                             -- Aeneas panic
+| Result.div    => 3                             -- 発散
+```
+本プランも**同じ 2 重マッチを `Ffi.lean` で採用**。ゼロから書き直しでも同じパターン踏襲は必須。
+
+**P25. `@[inline]` が性能に効く**
+
+PR #2 は `@[inline] private def u64OfUInt64` など ctor 周辺に inline 宣言を配置。これがないと function call overhead が FFI hot path で目立つ可能性。本プランの FastPath.lean / Marshal.lean でも同様に必要。
+
+**P26. IR ルートの列挙範囲 (11 ディレクトリ)**
+
+PR #2 の build.rs は `.lake/packages/{aeneas, mathlib, batteries, aesop, Qq, Cli, importGraph, LeanSearchClient, plausible, proofwidgets}/.lake/build/ir` + リポ直下、計 11 ルートを走査。もし依存が増減したら build.rs 修正が必要。plan に明記が漏れていた。
+
+**P27. `maxHeartbeats` オプション** → **A19 で解決** (2026-04-24)
+
+決定: FastPath.lean / Ffi.lean の冒頭に `set_option maxHeartbeats 1000000` を宣言。Aeneas 出力と統一して elaborator timeout を回避。
+
+### 運用・計測レベルの問題
+
+**P28. Benchmark output format 未定義** → **A18 で解決** (2026-04-24)
+
+決定: Option X (人間可読 Markdown 表 stdout のみ)、`tee` でログ保存、MD 表は手で docs に貼る。JSONL / CSV 化は future work。
+
+**P29. State の dec_ref discipline**
+
+Bench ループ内で FFI 結果 (`lean_object *` として返る State) を捨てるとき、`lean_dec_ref` を呼ばないと leak。N=1M 回のループで 1M × 500 MB = OOM 確定。**Rust 側に RAII ラッパー** (`LeanObjDrop<T>`) を用意すべき。
+
+**P30. `taskset` / CPU governor の可用性前提**
+
+§5.3 で `CPU governor performance / taskset` を推奨したが、`cpupower` が入っていない / `taskset` に root 権限が要る環境ではスキップ。ドキュメントに「できれば」「なければその旨注記」を明記すべき。
+
+---
+
+## 7.2 GitHub issue への分割案
+
+本タスクは粒度が大きいので、M 単位 + 主要サブ項目で issue に分解して管理する。Epic + sub-issues 形式。
+
+### Epic (トラッキング親 issue)
+
+- **Epic: Rust ↔ Lean 4 FFI ベンチマークハーネス実装**
+  - 関連 docs: `docs/ffi-feasibility.md`, `docs/ffi-implementation-plan.md`
+  - 関連ブランチ: `feat/ffi-benchmarks`
+  - 子 issue のチェックリストを本文に持つ
+  - Close 条件: 全子 issue close + M5 の `docs/rust-ffi-benchmarks.md` マージ
+
+### Sub-issues (M 毎 + P17/P19 などの設計判断単独)
+
+1. **feat(ffi): M0 環境準備とビルド sanity**
+   - elan 前提の明記 / `lake update` / `lake build` 成功確認
+   - 既存コミット `561b2f9` が含む docs 追加が前提
+
+2. **decide: Option II vs Option I 再確認 (P17 受け)**
+   - Rust-side marshaling の工数見積もりを M0 直後に実測 (小さい prototype)
+   - 結果次第で plan を更新
+   - Epic にブロック
+
+3. **feat(ffi): M1 `csf_ping` smoke (FFI 境界の最小検証)**
+   - `ConsensusLean4/Ffi.lean` + `rust-ffi/` 雛形
+   - 初期化 4 段階の実装
+   - build.rs の object 走査 + libleanshared リンク
+   - Acceptance: `cargo run --release` が exit 0
+
+4. **feat(lean): M2 FunsExternal axiom 置換 (P18 onset)**
+   - 5 axiom の real def (PR #2 参照、ゼロから再書き下ろし)
+   - `Vec.is_empty` は compute_lmd_ghost_head の入口で踏むので必須
+   - Acceptance: `#eval compute_lmd_ghost_head <minimal>` が panic しない
+
+5. **feat(lean): M3 FastPath.lean 実装**
+   - `processAttestationsFast` + `processBlockFast` + `stateTransitionFast`
+   - 小さい N での `#eval` parity vs Aeneas 出力
+   - Acceptance: 最小入力で両者 (fast と slow) の return が一致
+
+6. **feat(ffi): M4a Rust 側 `lean_types` + `ToLean` trait**
+   - P17 決定に応じて scope が変わる
+   - Rust struct 定義 + ToLean impl
+   - Lean 側 helper モジュール `Marshal.lean` (P19)
+   - Acceptance: `build_state_lean(2, 1)` が null でない valid `lean_object*`
+
+7. **feat(ffi): M4b Ffi.lean wrapper + noop twin**
+   - 4 本の `@[export]` 定義
+   - P24 (Result 2 重マッチ) 踏襲
+   - P23 (所有権) ドキュメント化
+   - Acceptance: `nm` で 5 シンボル可視
+
+8. **test(ffi): M4c Smoke Stage 2+3**
+   - 最小入力での e2e FFI コール
+   - 正常系 / 不正入力 / panic 不発の 3 ケース
+   - P29 (dec_ref) の RAII ラッパー
+   - Acceptance: 3 stages すべて OK
+
+9. **perf(ffi): M5 ベンチ本走行**
+   - N ∈ {100, 1K, 10K, 100K}, B ∈ {100, 1K, 10K}, A ∈ {32, 64, 128}
+   - 別プロセス / ru_maxrss 計測
+   - P28 (出力形式) 確定
+   - Acceptance: 計測データセットが生成される
+
+10. **docs(ffi): M5 `docs/rust-ffi-benchmarks.md` 作成**
+    - ベンチ結果集計 + 実測/外挿セル明示
+    - "crypto cost excluded" 注記 (P16)
+    - README に再現手順
+
+11. **chore(ffi): M5 完了時 PR 作成 + レビュー**
+    - Epic を close
+    - PR #2, PR #3 の扱い (close / 参考として残す) を判断
+
+Issue 10-11 を合わせて 11 個。M4 を a/b/c に分割しているので、実装担当が分散できるようにしている。**決定判断系 (Issue #2, #11) と実装系を分けている**のがポイント。
+
+---
+
+## 8. ユーザー確認が必要な論点
+
+2026-04-24 時点の確定事項 (全 Q 解消済):
+
+- **A1 (確定)**: compute_lmd_ghost_head は B と A を振る。state_transition は N を振る。2 エントリポイントで軸が異なることを `docs/rust-ffi-benchmarks.md` に明記する。
+- **A2 (確定)**: PR #2 / #3 は参考として残し、本タスクは新規ブランチで独立実装する。
+- **A3 (確定、旧 Q3)**: `hash_tree_root_*` は stub (ZERO) のまま、レポートに "crypto cost excluded" を注記。実 SSZ Merkleization は [issue #5](https://github.com/NyxFoundation/consensus-lean4/issues/5) で future work として追跡、本タスクでは実施しない。
+- **A4 (確定、旧 Q4)**: N スケール上限は、実測 N ≤ 100K (5 試行)、N=1M は 1 試行 (参考値)。ベンチ実行時間は ~10–15 分の見込み。
+- **A5 (確定、旧 Q5)**: PR #2 と `FunsExternal.lean` が編集衝突しうるが、両方 open のまま本ブランチで diff を最小化する方針 (選択肢 b)。axiom 置換は必要最小限に留める。
+- **A6 (確定)**: slow path (Aeneas 出力そのまま) のベンチは行わない。Option X で e2e のみ。形式検証の保証が Aeneas 出力には付随しないため、slow を残す動機がない。
+- **A7 (確定、旧 Q7)**: compute_lmd_ghost_head の B 上限は B ≤ 10K で打ち止め。B=32K (mainnet) は別途 `compute_lmd_ghost_head_fast` を書く必要があり、Future work。
+- **A8 (確定)**: 入力構築は Option II (Rust 側で State/Block/blocks/attestations を構築し `ToLean` で marshal → FFI)。marshal コストは timer 外に置き、ベンチ値は pipeline cost に絞る。
+- **A9 (確定)**: Option III (SSZ バイト列で FFI 境界を再設計) は future work。[issue #4](https://github.com/NyxFoundation/consensus-lean4/issues/4) で追跡、本タスクでは実施しない。
+- **A10 (確定)**: 2 エントリポイントは別プロセスで独立計測 (`ru_maxrss` peak を分離するため)。`cargo run --release --bin bench-state-transition` と `cargo run --release --bin bench-fork-choice` に分割。
+- **A15 (確定、§7.1 (c))**: Bench ループは **Option A** — 毎 iter で同じ contents の state/block を新規 alloc して pipeline に渡す。`lean_inc` で template を使い回す Option B は FBIP の refcount>1 分岐で deep clone が timer 内に入るため採用しない。
+- **A16 (確定、§7.1 P7)**: `csf_state_transition` の戻り値は **UInt8 sentinel** (0=ok, 1=domain err, 2=panic, 3=div)。Lean が返す新 State は破棄する。State chain は P11 (future work issue) で扱う。
+- **A17 (確定、§7.1 P29)**: Rust 側に `lean_object*` 用の RAII wrapper / dec_ref 規律は**不要**。Option A では Lean が input を consume して戻り値は UInt8 なので、Rust が保持する `lean_object*` がそもそも無い。
+- **A18 (確定、§7.1 P28)**: ベンチ出力形式は **Option X (人間可読 Markdown 表 stdout のみ)**。実行時に `| tee bench-results/*.txt` でログ保存、MD 表は手で `docs/rust-ffi-benchmarks.md` に貼る。JSONL / CSV 化は future work (必要になってから)。表記規約: 時間は cell サイズに応じて `{elapsed:?}` 自動切替、`ru_maxrss` は MB 表示、N/B/A は 1,000 区切りカンマ。
+- **A19 (確定、§7.1 P27)**: `ConsensusLean4/FastPath.lean` と `ConsensusLean4/Ffi.lean` の冒頭に `set_option maxHeartbeats 1000000` を入れる (Aeneas 出力と統一、elaboration timeout 回避)。runtime には無関係、diff 1 行。
+- **A20 (確定、§7.1 P18)**: M2 (FunsExternal の 5 axiom 置換) を M3 の **hard prerequisite** に昇格。`Result.branch` / `Result.from_residual` は Aeneas の `?` 演算子脱糖で必須、`Vec.is_empty` は `compute_lmd_ghost_head` entry、`Ordering.eq` は sort hot path、`Vec.clear` は `shift_window` で要るので**全 5 axiom を M2 で置換**。A5 の "diff 最小化" は「5 axiom だけ触って新規追加しない」の解釈に更新。実行順: M0 → M1 → M2 → M3 → M4 → M5。
+- **A21 (確定、§7.1 P21)**: `rust-ffi/build.rs` の `rerun-if-changed` を以下に拡張:
+  - `build.rs` (自身)
+  - `../ConsensusLean4/` (ディレクトリ全体、配下の .lean 全部をカバー)
+  - `../lakefile.lean`
+  - `../lean-toolchain`
+  - `../lake-manifest.json`
+- **A22 (確定、§7.1 P22)**: `rust-ffi/build.rs` の冒頭で `lake build` を自動 invoke (`Command::new("lake").arg("build").current_dir("..")`)。冪等 (cache 効けば ~1s)。lake 未 install は cargo エラーになり明示的に失敗、README で elan 必要性を書く。
+- **A23 (確定、§7.1 P19)**: Marshal.lean は**作らない**。Lean の proof irrelevance により `Vec α` の `property` フィールドは runtime に `lean_box(0)` に erase されるため、Rust が Vec の ctor layout (tag 0, 2 obj fields) を直接組んで OK。`wrap_list_as_vec(list: *mut lean_object) -> *mut lean_object` を Rust 側 1 関数だけ実装、element type 非依存。
+- **A24 (確定、§7.1 P20)**: Rust 側に `lean_list_nil()` / `lean_list_cons(head, tail)` / `list_from_iter(items, to_lean)` を `rust-ffi/src/to_lean.rs` に実装。iter.rev() + cons で正順 List を構築、N 要素で N 回 `lean_alloc_ctor`。
+- **A25 (確定、§7.1 P23)**: `lean_object*` の所有権は **owned / single-use** convention。Rust が FFI に渡したら即座に pointer を無効扱い、再利用禁止。Option A では Lean が consume して戻り値は UInt8 なので、Rust 側に `lean_inc_ref` / `lean_dec_ref` は**一切不要**。`@[export]` は PR #2 と同じく `@&` アノテーションなし (default owned) で書く。
+- **A26 (確定、§7.1 P5)**: モジュール初期化は **top-level エントリモジュール 1 本だけ**呼ぶ。`initialize_consensus_x2dlean4_ConsensusLean4_Ffi(1, null)` → 依存モジュール (Funs umbrella + Funs/{Types, JustifiedSlots, ForkChoice, StateTransition} / FunsExternal / FastPath / Types) は Lean runtime が transitive に初期化してくれる。PR #2 の実績パターン踏襲。検証は M1 smoke で実機確認。
+- **A27 (確定、§7.1 P8)**: `csf_*_noop` twin は「入力を受けて pipeline を走らせず即 return」。具体的には `UInt8` sentinel を `0` で即返す。Lean の `@[export]` convention で入力 `lean_object*` は consume される (Lean runtime が dec_ref)。paired-delta が測るのは:
+  - 主 wrapper: FFI 境界 + Lean 側 consume (dec_ref) + pipeline 本体
+  - noop twin: FFI 境界 + Lean 側 consume (dec_ref) のみ
+  - 差 = pipeline 本体の純粋コスト
+  - Rust 側の marshal は timer 外なのでどちらにも含まれない (A15 の Option A 設計)
+- **A28 (確定)**: P24 (Result 2 重マッチ)、P25 (`@[inline]` 命令)、P26 (IR 11 ディレクトリ列挙) は PR #2 の既存パターンを踏襲するだけの informational 項目。特別の判断不要、実装時に同じ形を再実装。
+  - P24: `packPipeline` で `Result.ok (Ok _, _) → 0` / `Result.ok (Err _, _) → 1` / `Result.fail _ → 2` / `Result.div → 3` の 4 分岐
+  - P25: marshal helper (`u64OfUInt64`, `usizeOfNat` 等) に `@[inline]` を付与
+  - P26: build.rs で 11 IR root (aeneas / mathlib / batteries / aesop / Qq / Cli / importGraph / LeanSearchClient / plausible / proofwidgets + repo 直下) を走査、`Cache` / `LongestPole` / `Shake` ディレクトリは除外
+
+本メモ承認時に残る論点: **なし** (全 Q 解消済)。
+
+---
+
+## 9. 検証 (承認後の実施方法)
+
+本メモ承認 → 次に「実装計画」を別途書いて承認を取る → 実装 → 以下で end-to-end 検証:
+
+1. **型チェック**: `lake build` が警告ゼロで通る
+2. **シンボル export**: `nm .lake/build/lib/libConsensusLean4.a | grep csf_` に `csf_ping`, `csf_state_transition`, `csf_state_transition_build`, `csf_compute_lmd_ghost_head`, `csf_compute_lmd_ghost_head_build` が全て出る
+3. **Smoke test Stage 1–3**: セクション 7 の 3 段階を順に通す (`csf_ping` → `csf_state_transition` 最小入力 → `csf_compute_lmd_ghost_head` 最小入力)
+4. **Sanity check**: state_transition と compute_lmd_ghost_head それぞれ、明らかに不正な入力で Err sentinel を返すこと、runtime panic なし
+5. **計測実行 (2 エントリポイントは別プロセスで独立実行)**:
+   - **プロセス分離の理由**: `ru_maxrss` はプロセスライフタイム全体の peak を拾うため、両ベンチを同一プロセスで連続実行すると後者の RSS に前者の peak が混入する。クリーンな per-entry-point メモリ測定のため CLI サブコマンド等で別 invocation にする (例: `cargo run --release -- bench-state-transition` と `cargo run --release -- bench-fork-choice`)。
+   - **state_transition**: N=100,1K,10K,100K で 5 試行 (N=1M は 1 試行)、A=64 固定、1 プロセス = 1 N 値 (N 間でも RSS 分離したい場合はさらに細分化)、`ru_maxrss` と elapsed を記録
+   - **compute_lmd_ghost_head**: (B, A) ∈ {100,1K,10K} × {32,128} で 5 試行、同様に per-cell プロセス分離、`ru_maxrss` と elapsed を記録
+   - 両者とも `lean_initialize_runtime_module` → `lean_initialize` → `initialize_<pkg>` は各プロセスで 1 回、ベンチループ外で実施 (初期化の ~43 ms はベンチ時間から除外)
+6. **ドキュメント更新**: `docs/rust-ffi-benchmarks.md` に新規結果を append、外挿セルと実測セルを明示
+7. **再現手順**: README に `elan which lean` / `lake build` / `cargo run --release` の 3 ステップを明記
+
+---
+
+## 10. 参考: 本メモ作成時に使った探索
+
+- `gh pr view 2 / 3 --json ...`, `gh pr diff 2 / 3`, `gh api .../pulls/{n}/commits`
+- Aeneas `Vec.lean` @ `864eddb4` を GitHub raw で取得
+- `ConsensusLean4/Funs/StateTransition.lean` (`state_transition.state_transition` @ :1356) と `ConsensusLean4/Funs/ForkChoice.lean` (`compute_lmd_ghost_head` @ :991) を直接読んで 2 エントリポイントのループ構造を確認 (2026-04-24 時点では旧 `Funs.lean` 単一ファイル、PR #17 マージ後 2026-04-30 から現構成)
+- leanprover/lean4 Issue #5509, #9420, #7917 の記述を参照
+- 実例 repos: lurk-lab/RustFFI.lean, DSLstandard/Lean4-FFI-Programming-Tutorial-GLFW, leanprover/lean4 `src/lake/examples/reverse-ffi/`
+
+---
+
+## 11. 付録: ファイル形式と変換の流れ
+
+Lean ↔ Rust FFI を組むときに出てくるファイル形式は数が多く、どれが誰によって生成され、どうつながるかが分かりにくい。この付録で一通り整理する。
+
+### 11.1 登場するファイル形式
+
+| 拡張子 / ファイル名 | 何者 | 生成元 | 用途 |
+|---|---|---|---|
+| `.lean` | Lean ソース | 人間 | 編集対象 |
+| `.olean` | Lean モジュールのコンパイル済み bytecode | `lean` コンパイラ | 他の Lean モジュールが `import` したときに読む。Lean interpreter の入力 |
+| `.ilean` | 言語サーバー (LSP) 用メタデータ index | `lean` コンパイラ | エディタの定義ジャンプ等。ビルド / FFI には不要 |
+| `.c` | Lean が生成した C 中間コード | `lean --c` オプション | 次ステップで C コンパイラに渡される |
+| `.c.o.export` | `.c` をコンパイルした object、`@[export]` シンボルが外部可視 | `leanc` (Lean 同梱 C コンパイラ wrapper) | **FFI 消費側から link する対象**。Rust build.rs が拾う |
+| `.c.o.noexport` | 同じく object、`@[export]` シンボルは hidden | `leanc` | Lean 同士のリンク用。FFI 側はスルー |
+| `.a` | 静的アーカイブ (複数 `.o` をまとめたもの) | `ar` (Lake `:static` facet) | 単一 `libFoo.a` として Rust からリンク可能 |
+| `.so` | 共有ライブラリ | Lake (`:shared` facet / `precompileModules := true`) | 本タスクでは使わない |
+| `libleanshared.so` | **Lean runtime 本体**の共有ライブラリ | elan toolchain 同梱 (自分ではビルドしない) | Rust binary が runtime 関数 (`lean_alloc_ctor` 等) を呼ぶために dylib link する |
+| `libInit_shared.so` | Lean 標準ライブラリ `Init` の native ビルド | 同上 | libleanshared と一緒に dylib link |
+
+### 11.2 パイプライン全体図
+
+```
+人間が書いた Lean ソース
+  ConsensusLean4/Ffi.lean                 (@[export csf_foo] def foo ...)
+         │
+         │  lean --o Ffi.olean --c Ffi.c  (lake が駆動)
+         ▼
+  ┌─────────────────────────────┐
+  │ .lake/build/lib/*.olean       (import 時に使われる、FFI には無関係)
+  │ .lake/build/lib/*.ilean       (LSP 用、FFI には無関係)
+  │ .lake/build/ir/*.c            (Lean → C 中間)
+  └─────────────────────────────┘
+         │
+         │  leanc -c -o Ffi.c.o.export Ffi.c  (Lean が駆動、@[export] シンボルが visible)
+         │  leanc -c -o Ffi.c.o.noexport Ffi.c  (hidden 版、内部リンク用)
+         ▼
+  ┌─────────────────────────────┐
+  │ .lake/build/ir/*.c.o.export    ← これを Rust が link
+  │ .lake/build/ir/*.c.o.noexport   (FFI 側からは不要)
+  └─────────────────────────────┘
+         │
+         │  ar rcs libConsensusLean4.a *.c.o.export       (Lake :static facet)
+         ▼
+  .lake/build/lib/libConsensusLean4.a
+         │
+         │  Rust 側 build.rs で (PR #2 の実例):
+         │    cargo:rustc-link-arg=-Wl,--start-group
+         │    cargo:rustc-link-arg=<各 .c.o.export のパス>  (再帰スキャン)
+         │    cargo:rustc-link-arg=-Wl,--end-group
+         │    cargo:rustc-link-search=native=<toolchain>/lib/lean
+         │    cargo:rustc-link-lib=dylib=leanshared
+         │    cargo:rustc-link-lib=dylib=Init_shared
+         │    cargo:rustc-link-lib=dylib=stdc++
+         │    cargo:rustc-link-lib=dylib=gmp
+         │    cargo:rustc-link-arg=-Wl,-rpath,<toolchain>/lib/lean
+         ▼
+  target/release/rust-ffi   ← 最終 binary
+    ├── Lean が吐いた .c.o.export が static link 済
+    ├── libleanshared.so, libInit_shared.so を実行時に dlopen
+    └── rpath 埋め込みで LD_LIBRARY_PATH 不要
+```
+
+### 11.3 Lean が吐く `.c` は普通の C じゃない
+
+Lean compiler が `.c` を生成するとき、ほとんどの Lean 値は `lean_object *` (ポインタ) として表現される。プリミティブ型 (UInt*, Bool, Float など) は unbox されて C のネイティブ型で渡される。
+
+**例: プリミティブのみ (unboxed)**
+```lean
+@[export csf_add] def add (a b : UInt64) : UInt64 := a + b
+```
+```c
+// 生成される C (概念)
+LEAN_EXPORT uint64_t csf_add(uint64_t a, uint64_t b) { return a + b; }
+```
+Rust 側は `extern "C" fn csf_add(a: u64, b: u64) -> u64;` でそのまま呼べる。
+
+**例: ADT を扱う (boxed)**
+```lean
+@[export csf_state_transition]
+def csfStateTransition (state : State) (block : Block) : UInt8 := ...
+```
+```c
+LEAN_EXPORT uint8_t csf_state_transition(lean_object* state, lean_object* block) { ... }
+```
+Rust 側:
+```rust
+extern "C" {
+    fn csf_state_transition(state: *mut lean_object, block: *mut lean_object) -> u8;
+}
+```
+呼ぶ前に `state` と `block` を `lean_alloc_ctor` などで組み立てる必要がある (= Option II の ToLean impl の仕事)。
+
+### 11.4 プリミティブ vs boxed の境界
+
+| 型 | C での表現 | 備考 |
+|---|---|---|
+| `UInt8` / `UInt16` / `UInt32` | `uint8_t` / `uint16_t` / `uint32_t` | unboxed |
+| `UInt64` / `USize` | `uint64_t` / `size_t` | unboxed (64bit OS 前提) |
+| `Float` / `Float32` | `double` / `float` | unboxed |
+| `Bool` | `uint8_t` | unboxed (0/1) |
+| `Char` | `uint32_t` | unboxed (Unicode scalar) |
+| `Nat` / `Int` | `lean_object*` | **boxed** (任意精度整数) |
+| `String` | `lean_object*` | **boxed** |
+| ADT (構造体 / enum / inductive) | `lean_object*` | **boxed** |
+| `Array α` | `lean_object*` | **boxed** |
+| `List α` | `lean_object*` | **boxed** |
+
+本タスクで使う Aeneas 生成型の分類:
+- `Std.U64` = `{ bv : BitVec 64 }` の構造体 → **boxed** (素朴な UInt64 ではない点に注意)
+- `H256` = `{ val : Array U8 // ... }` → **boxed** (Array + proposition)
+- `Validator` / `Checkpoint` / `Block` / `State` → **boxed** (ADT)
+- `Vec α` = `{ l : List α // ... }` → **boxed** (List)
+
+したがって FFI で渡す `State` は **lean_object ツリー** であり、Rust 側 `ToLean` impl は再帰的にそのツリーを組み立てる。
+
+### 11.5 `@[export]` 属性が何をするか
+
+```lean
+@[export csf_foo] def foo (x : UInt64) : UInt64 := x + 1
+```
+
+コンパイラがこれを見ると:
+1. **関数名を mangle せず `csf_foo` でそのまま C シンボルを出す** (通常は `l_ConsensusLean4_Ffi_foo___boxed` のように Lean 内部空間の名前がつく)
+2. `LEAN_EXPORT` マクロを付ける (`__attribute__((visibility("default")))` + `extern "C"` に展開)
+3. その object は `.c.o.export` 側に配置される (`.c.o.noexport` には入らない)
+
+修飾しない普通の `def`:
+- 名前はマングルされる (バージョン間で変わりうる)
+- デフォルトで hidden visibility
+- `.c.o.noexport` に出る
+
+**ルール**: **FFI 境界に露出する関数は必ず `@[export <安定な名前>]` を付ける**。`csf_` プレフィックスは consensus-lean4 FFI symbols 用の慣例 (PR #2 で採用済)。
+
+### 11.6 ランタイム初期化は 4 段階
+
+Rust main から Lean 関数を呼ぶ前に、以下を**この順序で exactly once** 実行する (PR #2 の main.rs 実例):
+
+```rust
+extern "C" {
+    fn lean_initialize_runtime_module();
+    fn lean_initialize();
+    fn initialize_consensus_x2dlean4_ConsensusLean4_Ffi(builtin: u8, w: *mut c_void) -> *mut c_void;
+    fn lean_io_mark_end_initialization();
+}
+
+unsafe {
+    lean_initialize_runtime_module();                                   // (1) runtime core を起動
+    lean_initialize();                                                  // (2) IO monad の世界を初期化
+    initialize_consensus_x2dlean4_ConsensusLean4_Ffi(1, std::ptr::null_mut());  // (3) 各モジュールの top-level 初期化
+    lean_io_mark_end_initialization();                                  // (4) 初期化フェーズ終了を runtime に通知
+}
+// この後に @[export] 関数を呼んで OK
+```
+
+- **(1)** runtime 側のシングルトン状態 (allocator, thread-local 等) を構築
+- **(2)** IO action を走らせる基盤 (world トークン) を用意
+- **(3)** 各 Lean モジュールの `def` の side effect を実行し、constant を alloc。`initialize_<escaped_package>_<module_path>` が関数名。dash (`-`) は `_x2d` に escape される
+    - 例: パッケージ `consensus-lean4`、モジュール `ConsensusLean4.Ffi` → `initialize_consensus_x2dlean4_ConsensusLean4_Ffi`
+    - 依存モジュール (`ConsensusLean4.Funs`, `ConsensusLean4.FastPath` 等) の初期化は Lean runtime が transitive に呼んでくれるので、**エントリモジュール分だけ呼べばよい**
+- **(4)** 「初期化完了」を runtime に伝える。これを呼ばずに通常の Lean 関数を呼ぶと、あるケースで IO state が inconsistent になる (PR #2 実装はこれを入れている)
+
+この順序を破ると `lean_panic_fn` で落ちるか、最悪 SIGSEGV。
+
+### 11.7 リンク構成の地形
+
+Rust binary が最終的に必要とするもの:
+
+1. **Lean コードの object 群** (`.c.o.export`): Lake が生成。build.rs で `.lake/build/ir/` 以下を再帰的にスキャンし、`Cache` / `LongestPole` / `Shake` ディレクトリを除外 (Mathlib の meta-build ツール用 object が入っているため) して拾う
+2. **Lean runtime の shared lib**: `<toolchain>/lib/lean/libleanshared.so`。**`lib/` 直下ではなく `lib/lean/` の下**にある点に注意
+3. **Lean Init 標準ライブラリ**: `libInit_shared.so` (同じディレクトリ)
+4. **C++ / gmp**: Lean runtime が依存しているので dylib link
+5. **RPATH**: `-Wl,-rpath,<toolchain>/lib/lean` を埋め込んで LD_LIBRARY_PATH なしで動かせるようにする
+
+`<toolchain>` の取得は `elan which lean` → parent 2 段上がって `lib/lean` を join する (PR #2 build.rs 方式)。ハードコードすると `rustup`/`elan` の再インストールで壊れる。
+
+### 11.8 誰がどのファイルを触るか (まとめ)
+
+| 担当 | ファイル |
+|---|---|
+| **自分で書く (新規)** | `ConsensusLean4/FastPath.lean`、`ConsensusLean4/Ffi.lean`、`rust-ffi/src/*.rs`、`rust-ffi/build.rs`、`rust-ffi/Cargo.toml` |
+| **自分で書く (既存編集)** | `ConsensusLean4/FunsExternal.lean` (axiom 5 本置換)、`ConsensusLean4.lean` (root index に `import ConsensusLean4.Ffi` 追加)、`.gitignore` (`rust-ffi/target/` 追加) |
+| **Aeneas が再生成する (手動編集しない)** | `ConsensusLean4/Types.lean`、`ConsensusLean4/Funs.lean` (umbrella、import 4 本のみ)、`ConsensusLean4/Funs/{Types, JustifiedSlots, ForkChoice, StateTransition}.lean`、`ConsensusLean4/FunsExternal_Template.lean` |
+| **lakefile** | `lakefile.lean` (現 9 行据置、`globs := #[.submodules \`ConsensusLean4]` は不要) |
+| **Lake が自動で作る** | `.lake/build/lib/*.olean`、`.lake/build/lib/*.ilean`、`.lake/build/ir/*.c`、`.lake/build/ir/*.c.o.export`、`.lake/build/ir/*.c.o.noexport`、`.lake/build/lib/*.a` |
+| **toolchain 付属 (自分ではビルドしない)** | `libleanshared.so`、`libInit_shared.so`、`lean_*` runtime 関数群 |
+| **Cargo が自動で作る** | `rust-ffi/target/release/*` (最終 binary) |
+
+`.lake/` と `target/` は `.gitignore` 対象 (現 `.gitignore`: `.lake/` `lake-packages/` `build/` `rust-ffi/target/` の 4 行)。
+
+---
+
+## Next action (本メモ承認後)
+
+完了済 (2026-04-24):
+- ✓ `docs/ffi-feasibility.md` 作成 + push (commit `cbeb548`)
+- ✓ [issue #4](https://github.com/NyxFoundation/consensus-lean4/issues/4) 発行 (Option III: SSZ バイト列 FFI)
+- ✓ [issue #5](https://github.com/NyxFoundation/consensus-lean4/issues/5) 発行 (`hash_tree_root_*` real 実装)
+- ✓ Q3, Q4, Q5, Q7 を A3, A4, A5, A7 として解消 (§8)
+- ✓ §11「付録: ファイル形式と変換の流れ」docs 同期
+- ✓ §6.1 「C5 詳細: 署名検証と Rust 連携」docs 同期
+- ✓ `docs/ffi-implementation-plan.md` 作成 + push (commit `561b2f9`)
+- ✓ 事前検証: PR #2 実ソース / Types.lean State 構造 / 現 main FunsExternal の確認
+- ✓ §7.1 予見問題 P17-P30 列挙、§7.2 GitHub issue 分割案を追加
+
+更新 (2026-04-30):
+- ✓ PR #17 マージ (Funs.lean → Funs/{Types,JustifiedSlots,ForkChoice,StateTransition}.lean に namespace 別分割) を反映
+- ✓ §2.1 / §2.2 / §4.1 骨子手順 3 / §10 / §11.8 のファイルパスと行番号を新構成に書き換え
+- ✓ §A26 transitive 初期化対象に Funs/ サブモジュール 4 本を明示
+- ✓ `feat/ffi-benchmarks` を main `220e01a` 直上に rebase (HEAD `d562753`)
+
+残り (承認後):
+1. ✓ §7.1 / §7.2 を `docs/ffi-feasibility.md` に同期 (2026-04-24 完了)
+2. ✓ [issue #6](https://github.com/NyxFoundation/consensus-lean4/issues/6) 作成 (P11: realistic block-building benchmark, state chaining across blocks)
+3. ✓ Epic + サブ issue を GitHub に作成 (issue #7-#16)
+4. 実装は Epic の sub-issue 毎に進める (M0 → M1 → M2 → … の順)
+5. lean-toolchain 変更が必要になった場合は**単独で**再確認 (包括承認下でも別扱い)

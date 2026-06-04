@@ -57,6 +57,35 @@ lake build
 The Aeneas runtime library (and its Mathlib dependency) is fetched automatically via
 `lakefile.lean`.
 
+## Benchmarks (M5)
+
+The handwritten fast path for `state_transition` and the Aeneas-generated `compute_lmd_ghost_head`
+are exposed to a Rust harness via `@[export]` symbols in `ConsensusLean4/Ffi.lean`. The harness
+measures pipeline cost via paired-delta against a `_buildonly` twin (Lean DCE is suppressed with
+`@[noinline]` consume helpers so the build phase is genuinely captured).
+
+```bash
+# 1. Verify the toolchain.
+elan which lean
+
+# 2. Build Lean static + Rust bench bins (build.rs auto-invokes `lake build`).
+lake build ConsensusLean4:static
+cd rust-ffi && cargo build --release
+
+# 3. Run the benches. Default cells are sized for ~30 s / process; opt-in flags
+#    extend the axis. Per-cell `ru_maxrss` isolation needs separate invocations.
+target/release/bench-state-transition                      # N ∈ {100, 1K, 10K, 100K}
+target/release/bench-state-transition --include-1m         # + N=1M (1 trial, ~0.1 s)
+target/release/bench-fork-choice                           # B=100 × A ∈ {32, 128}
+target/release/bench-fork-choice --include-1k              # + B=1K (~6 min/cell)
+target/release/bench-state-transition --single-n=100000    # one cell, ru_maxrss-clean
+```
+
+Reference budgets and judgment criteria live in [`docs/timing-budget.md`](docs/timing-budget.md);
+detailed result tables are in [`docs/rust-ffi-benchmarks.md`](docs/rust-ffi-benchmarks.md).
+Crypto cost (`hash_tree_root_*`) is excluded — those return `H256.ZERO` per the spec stubs in
+`ConsensusLean4/Funs/Types.lean`.
+
 ## Source
 
 Generated from the [ethlambda](https://github.com/lambdaclass/ethlambda) Rust codebase
