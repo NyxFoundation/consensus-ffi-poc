@@ -289,6 +289,47 @@ cd rust-ffi && cargo build --release --bin bench-ffi-ssz
 target/release/bench-ffi-ssz            # V = 4, 8, 64, 512, 4096 (spec range)
 ```
 
+## 4e. STF 忠実度 — leanSpec `spec.py` 対応と realistic 化の差分
+
+計測対象の `stateTransitionFast` が leanSpec 正準 STF (`src/lean_spec/forks/lstar/spec.py` の `state_transition`, L614) のどこを実装しているかを明記する。**本ベンチの数値は "完全な STF" ではなく以下の被覆範囲に対する値**である点に注意 (= 実 STF コストの下限)。
+
+leanSpec `state_transition` (L614-647) は 4 ステップ:
+
+```python
+def state_transition(state, block, valid_signatures=True):
+    if not valid_signatures: raise              # 1. 署名は前提条件 (検証は外部)
+    advanced  = process_slots(state, block.slot) # 2.
+    new_state = process_block(advanced, block)   # 3. = header + attestations
+    assert block.state_root == hash_tree_root(new_state)  # 4.
+    return new_state
+```
+
+| leanSpec `spec.py` | consensus-lean4 | 状態 |
+|---|---|---|
+| 2. `process_slots` (L135) | `state_transition.process_slots` | ✅ 実装 |
+| 3. `process_block` (L332) | `processBlockFast` | ✅ 実装 |
+| ├ `process_block_header` (L195) | `state_transition.process_block_header` | ✅(内部 HTR は stub) |
+| └ `process_attestations` (L385) | `processAttestationsFast` + `try_finalize` | ✅ 実装 |
+| 4. `hash_tree_root` 照合 (L644) | `hash_tree_root_state`→`eq`→`StateRootMismatch` | ⚠️ 枠のみ。HTR は `ok H256.ZERO` stub |
+| 1. `valid_signatures` 前提 (L634) | — | ❌ 引数なし(常に valid 扱い) |
+| `verify_signatures` (L864, 別メソッド) | — | ❌ 完全欠如 |
+
+→ **`state_transition` 本体の step 2・3 は完全、step 4 は構造のみ実装済み。** 欠けているのは関数外の署名検証と、step 4 の実ハッシュ。
+
+### realistic STF への差分(実装先つき)
+
+| # | 欠けている処理 | 実装先 | 備考 |
+|---|---|---|---|
+| ① | `verify_signatures` (L864): 提案者 + 集約署名 (XMSS) | **Rust/FFI**(leanSig/leanMultisig, Plonky3) + 段取りは Lean | leanSpec では STF の外。最大コスト |
+| ② | 実 `hash_tree_root` (step 4 / header 内) | merkleize 構造=**Lean**、**Poseidon1** 置換=Rust/FFI or Lean | leanSpec は **Poseidon1/KoalaBear**(SHA-256 ではない) |
+| ③ | 非空 attestation/justification 入力 | データ(leanSpec テストベクタ) | 現 fixture は空で 3SF 本体が未駆動 |
+| ④ | 正準 SSZ codec | **Lean**(decode) | 現状はフラット自前コーデック |
+| ⑤ | マルチスロット/エポック境界 | **Lean**(既存ロジック) | 入力次第で駆動 |
+
+**信頼境界の原則**: 検証対象ロジック (STF / SSZ decode / merkleize 構造 / 署名検証の段取り) は Lean、重い暗号プリミティブ (Poseidon1 置換, XMSS/集約 ZK 検証) は Rust/FFI。`compute_block_weights` (L1370) は STF ではなく fork-choice(§2 `compute_lmd_ghost_head`)で別系統。
+
+**ベンチ解釈への含意**: §1/§4 の数値は「署名検証なし・HTR=ZERO・attestation 空」での値。realistic STF では ① 署名検証(支配項)+ ② Poseidon HTR が加わり、桁が上がる。現数値は **FFI/decode/STF ロジックの下限**として読むこと。
+
 ## 5. Future work
 
 `docs/ffi-feasibility.md` に既出の項目を実数値で裏付け:
