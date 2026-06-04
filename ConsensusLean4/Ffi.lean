@@ -312,3 +312,174 @@ def csfBenchComputeLmdGhostHeadBuildOnly
   let blocks := buildForkChoiceBlocks b
   let atts := buildForkChoiceAttestations b a
   consumeBlocksVec blocks ^^^ consumeAttsVec atts
+
+/-! ## M6 — FFI marshalling cost.
+
+The §1/§2 benches cross only primitive `UInt64`, so they measure Lean-side
+compute with the (near-zero) boundary cost cancelled out. This pair measures
+the cost the *real* SSZ-bytes boundary (issue #4) would add: a `ByteArray`
+(`lean_sarray_object`) is built on the Rust side via the `csf_make_bytearray`
+C shim (alloc + memcpy O(size)), handed to the export as an owned argument,
+and dec_ref'd by Lean's runtime on return.
+
+No SSZ codec and no `hash_tree_root`/SHA are involved — `ByteArray` is a flat
+buffer, so (de)serialization is pure byte layout. `_touch` reads every byte
+(XOR-fold), a lower bound on what a real decoder pays to scan its input;
+`_noop` only consumes the argument, isolating alloc + memcpy + dec_ref. -/
+
+/-- Touch every byte (decode-scan lower bound). Consumes `data` (dec_ref). -/
+@[export csf_bench_marshal_touch]
+def csfBenchMarshalTouch (data : ByteArray) : UInt8 :=
+  data.foldl (fun acc x => acc ^^^ x) 0
+
+/-- Consume `data` without reading it. Paired-delta twin: the gap from
+`_touch` is the Lean-side byte-scan, leaving alloc + memcpy + dec_ref. -/
+@[export csf_bench_marshal_noop]
+def csfBenchMarshalNoop (_data : ByteArray) : UInt8 := 0
+
+/-! ## M7 — end-to-end: marshal → decode → pure STF.
+
+This wires the full SSZ-bytes path (issue #4) the M6 marshal bench left
+disconnected: a `ByteArray` is decoded into the typed `State` / `Block` and
+fed to the pure `stateTransitionFast`. The byte layout is a simple flat,
+length-prefixed binary codec (NOT canonical SSZ) defined to round-trip with
+the Rust serializer in `bench-ffi-ssz.rs`; it covers every field of `State`
+and `Block`. No `hash_tree_root`/SHA is involved — decoding is pure layout.
+
+Layout: U64 = 8 bytes LE; H256 = 32 bytes; pubkey = 52 bytes; Bool = 1 byte;
+`Vec α` = U64 count then `count` elements. Out-of-range reads return 0
+(`ByteArray.get!` default), so the Rust side must supply every byte read. -/
+
+@[inline] private def u8OfUInt8 (x : UInt8) : Std.U8 :=
+  Std.U8.ofNat x.toNat (by
+    have hlt : x.toNat < UInt8.size := x.toNat_lt
+    have hsize : UInt8.size = 256 := by decide
+    rw [Std.UScalar.cMax_eq_pow_cNumBits]
+    show x.toNat ≤ 2 ^ Std.UScalarTy.U8.cNumBits - 1
+    have hbits : Std.UScalarTy.U8.cNumBits = 8 := rfl
+    rw [hbits]; omega)
+
+@[inline] private def readU64LE (d : ByteArray) (o : Nat) : UInt64 :=
+  let b : Nat → UInt64 := fun i => (d.get! (o + i)).toUInt64
+  b 0 ||| (b 1 <<< 8) ||| (b 2 <<< 16) ||| (b 3 <<< 24)
+    ||| (b 4 <<< 32) ||| (b 5 <<< 40) ||| (b 6 <<< 48) ||| (b 7 <<< 56)
+
+@[inline] private def rdU64 (d : ByteArray) (o : Nat) : Std.U64 × Nat :=
+  (u64OfUInt64 (readU64LE d o), o + 8)
+
+@[inline] private def rdCount (d : ByteArray) (o : Nat) : Nat × Nat :=
+  ((readU64LE d o).toNat, o + 8)
+
+private def readH256 (d : ByteArray) (o : Nat) : types.H256 :=
+  Array.make 32#usize ((List.range 32).map (fun i => u8OfUInt8 (d.get! (o + i))))
+
+private def readPubkey (d : ByteArray) (o : Nat) : Array Std.U8 52#usize :=
+  Array.make 52#usize ((List.range 52).map (fun i => u8OfUInt8 (d.get! (o + i))))
+
+@[inline] private def rdH256 (d : ByteArray) (o : Nat) : types.H256 × Nat :=
+  (readH256 d o, o + 32)
+
+private def rdCheckpoint (d : ByteArray) (o : Nat) : types.Checkpoint × Nat :=
+  ({ root := readH256 d o, slot := u64OfUInt64 (readU64LE d (o + 32)) }, o + 40)
+
+private def rdHeader (d : ByteArray) (o : Nat) : types.BlockHeader × Nat :=
+  ({ slot := u64OfUInt64 (readU64LE d o)
+     proposer_index := u64OfUInt64 (readU64LE d (o + 8))
+     parent_root := readH256 d (o + 16)
+     state_root := readH256 d (o + 48)
+     body_root := readH256 d (o + 80) }, o + 112)
+
+private def rdVecH256 (d : ByteArray) (o : Nat) :
+    alloc.vec.Vec types.H256 × Nat :=
+  let (cnt, o) := rdCount d o
+  let xs := (List.range cnt).map (fun i => readH256 d (o + i * 32))
+  (buildVecFromList xs (alloc.vec.Vec.new types.H256), o + cnt * 32)
+
+private def rdVecBool (d : ByteArray) (o : Nat) :
+    alloc.vec.Vec Bool × Nat :=
+  let (cnt, o) := rdCount d o
+  let xs := (List.range cnt).map (fun i => d.get! (o + i) != 0)
+  (buildVecFromList xs (alloc.vec.Vec.new Bool), o + cnt)
+
+private def rdValidator (d : ByteArray) (o : Nat) : types.Validator × Nat :=
+  ({ pubkey := readPubkey d o, index := u64OfUInt64 (readU64LE d (o + 52)) }, o + 60)
+
+private def rdVecValidator (d : ByteArray) (o : Nat) :
+    alloc.vec.Vec types.Validator × Nat :=
+  let (cnt, o) := rdCount d o
+  let xs := (List.range cnt).map (fun i => (rdValidator d (o + i * 60)).1)
+  (buildVecFromList xs (alloc.vec.Vec.new types.Validator), o + cnt * 60)
+
+private def rdAttData (d : ByteArray) (o : Nat) : types.AttestationData × Nat :=
+  ({ slot := u64OfUInt64 (readU64LE d o)
+     head := (rdCheckpoint d (o + 8)).1
+     target := (rdCheckpoint d (o + 48)).1
+     source := (rdCheckpoint d (o + 88)).1 }, o + 128)
+
+private def rdAggAtt (d : ByteArray) (o : Nat) :
+    types.AggregatedAttestation × Nat :=
+  let (bits, o) := rdVecBool d o
+  let (data, o) := rdAttData d o
+  ({ aggregation_bits := bits, data := data }, o)
+
+private def rdAggAttList (d : ByteArray) :
+    Nat → Nat → List types.AggregatedAttestation →
+    List types.AggregatedAttestation × Nat
+  | 0,     o, acc => (acc.reverse, o)
+  | k + 1, o, acc => let (a, o') := rdAggAtt d o; rdAggAttList d k o' (a :: acc)
+
+private def rdVecAggAtt (d : ByteArray) (o : Nat) :
+    alloc.vec.Vec types.AggregatedAttestation × Nat :=
+  let (cnt, o) := rdCount d o
+  let (xs, oEnd) := rdAggAttList d cnt o []
+  (buildVecFromList xs (alloc.vec.Vec.new types.AggregatedAttestation), oEnd)
+
+private def decodeState (d : ByteArray) (o : Nat) : types.State × Nat :=
+  let (genesisTime, o) := rdU64 d o
+  let (slot, o) := rdU64 d o
+  let (hdr, o) := rdHeader d o
+  let (lj, o) := rdCheckpoint d o
+  let (lf, o) := rdCheckpoint d o
+  let (hbh, o) := rdVecH256 d o
+  let (js, o) := rdVecBool d o
+  let (vals, o) := rdVecValidator d o
+  let (jr, o) := rdVecH256 d o
+  let (jv, o) := rdVecBool d o
+  ({ config := { genesis_time := genesisTime }
+     slot := slot
+     latest_block_header := hdr
+     latest_justified := lj
+     latest_finalized := lf
+     historical_block_hashes := hbh
+     justified_slots := js
+     validators := vals
+     justifications_roots := jr
+     justifications_validators := jv }, o)
+
+private def decodeBlock (d : ByteArray) (o : Nat) : types.Block × Nat :=
+  let (slot, o) := rdU64 d o
+  let (proposer, o) := rdU64 d o
+  let (parentRoot, o) := rdH256 d o
+  let (stateRoot, o) := rdH256 d o
+  let (atts, o) := rdVecAggAtt d o
+  ({ slot := slot
+     proposer_index := proposer
+     parent_root := parentRoot
+     state_root := stateRoot
+     body := { attestations := atts } }, o)
+
+/-- End-to-end: decode `State ++ Block` from `data`, then run the pure fast
+state transition. `data` is consumed (dec_ref). -/
+@[export csf_bench_state_transition_ssz_run]
+def csfBenchStateTransitionSszRun (data : ByteArray) : UInt8 :=
+  let (state, o) := decodeState data 0
+  let (block, _) := decodeBlock data o
+  packStatePipeline (ConsensusLean4.FastPath.stateTransitionFast state block)
+
+/-- Twin: decode only, skip the pipeline. Paired-delta isolates decode cost
+(`_ssz_run` − `_ssz_decode` = pure STF; `_ssz_decode` − marshal = decode). -/
+@[export csf_bench_state_transition_ssz_decode]
+def csfBenchStateTransitionSszDecode (data : ByteArray) : UInt8 :=
+  let (state, o) := decodeState data 0
+  let (block, _) := decodeBlock data o
+  consumeState state ^^^ consumeBlock block

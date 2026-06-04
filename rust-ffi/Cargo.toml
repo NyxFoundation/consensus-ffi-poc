@@ -7,6 +7,9 @@ publish = false
 [dependencies]
 libc = "0.2"
 
+[build-dependencies]
+cc = "1"
+
 [[bin]]
 name = "rust-ffi"
 path = "src/main.rs"
@@ -22,6 +25,14 @@ path = "src/bin/bench-fork-choice.rs"
 [[bin]]
 name = "bench-ffi-overhead"
 path = "src/bin/bench-ffi-overhead.rs"
+
+[[bin]]
+name = "bench-ffi-marshal"
+path = "src/bin/bench-ffi-marshal.rs"
+
+[[bin]]
+name = "bench-ffi-ssz"
+path = "src/bin/bench-ffi-ssz.rs"
 
 [profile.release]
 debug = true

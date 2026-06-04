@@ -8,6 +8,8 @@ tags:
   - state-transition
   - fork-choice
   - boundary-cost
+  - marshalling
+  - decode
 ---
 
 # Rust ↔ Lean 4 FFI ベンチマーク 実測結果
@@ -166,6 +168,167 @@ cd consensus-lean4 && lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release --bin bench-ffi-overhead
 target/release/bench-ffi-overhead
 ```
+
+## 4c. FFI マーシャリングコスト 追測 (2026-06-04)
+
+§4b で「プリミティブ越境は ~0、ただしこれは床値。実運用の FFI コストは `lean_object*` のマーシャル/dec_ref で、それは未測定」と結論した。その未測定分を `bench-ffi-marshal` (`rust-ffi/src/bin/bench-ffi-marshal.rs`) で直接計測した。
+
+本来の SSZ-bytes 境界 (issue #4) で新規に立つコスト ——「Rust 側で `ByteArray` を構築 (alloc + memcpy O(size)) → owned 引数として越境 → Lean ランタイムが dec_ref」—— を、ペイロードサイズの関数として測る。`ByteArray` はフラットバッファなので **SSZ コーデックも `hash_tree_root`/SHA も不要** (serde はバイト並びのみ)。
+
+- `csf_make_bytearray` (C shim, `rust-ffi/csf_marshal_shim.c`): `lean_alloc_sarray` + `memcpy`。`lean_alloc_sarray`/`lean_sarray_cptr` は lean.h で `static inline` のため Rust から直接リンクできず、lean.h に対してコンパイルした C shim 経由で呼ぶ (build.rs が `cc` でビルド)。
+- Lean export 2 種 (`ConsensusLean4/Ffi.lean` M6): `csf_bench_marshal_touch` = 全バイトを XOR-fold (decode スキャンの下限)、`csf_bench_marshal_noop` = 引数を消費するだけ (alloc + memcpy + dec_ref)。差 = Lean 側スキャン。
+- サイズ軸は §1 の N に対応: Validator = pubkey(52)+index(8) = 60 B とし、ペイロード S = N·60。**正準 SSZ ではなく代表サイズのフラットバッファ。** 計測手法は §1/§4b と同様 (target 200ms/trial, 11 試行中央値, `black_box`)。
+
+### 計測結果
+
+| N | payload S | marshal (noop) | full (marshal+scan) | scan Δ | marshal GB/s | marshal ns/byte |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 60 B | 25.3 ns | 32.3 ns | 7.0 ns | 2.4 | 0.422 |
+| 100 | 5.9 KB | 114 ns | 235 ns | 121 ns | 52.4 | 0.019 |
+| 1,000 | 58.6 KB | 1.32 µs | 2.84 µs | 1.52 µs | 45.5 | 0.022 |
+| 10,000 | 585.9 KB | 20.5 µs | 32.1 µs | 11.6 µs | 29.3 | 0.034 |
+| 100,000 | 5.7 MB | 223 µs | 351 µs | 128 µs | 26.9 | 0.037 |
+| 1,000,000 | 57.2 MB | **14.39 ms** | 16.64 ms | 2.25 ms | 4.2 | 0.240 |
+
+### 判定 (vs §1 の STF 計算コスト)
+
+| N | marshal (片道) | §1 STF pipeline | marshal / STF |
+|---:|---:|---:|---:|
+| 100 | 114 ns | 41.3 µs | 0.3% |
+| 100,000 | 223 µs | 1.80 ms | 12% |
+| 1,000,000 | **14.39 ms** | 22.02 ms | **65%** |
+
+→ **§4b の予測どおり、オーバーヘッドはサイズに比例して変化する。**
+
+1. **小サイズ (devnet 相当, validator 数百 = KB 級)**: 100〜1,300 ns。§4b のプリミティブ越境と同様、**実質ノイズ**。SSZ 化しても体感不変。
+2. **大サイズ (mainnet 相当, validator 1M = ~57 MB)**: 片道 **14.4 ms** で、STF 計算本体 (22 ms) の **約 65%**。往復 (入力デコード + 結果エンコード) なら ~29 ms で STF を上回る。**この規模ではマーシャルが支配項の一つになる**。
+3. **スループットの劣化**: 小サイズで ~52 GB/s (L2/L3 内に収まる) → 57 MB で 4.2 GB/s。これは純粋な memcpy 帯域ではなく、**呼び出しごとに 57 MB を新規 alloc → first-touch ページフォルト → memcpy → dec_ref/free** するためで、per-call マーシャルの現実的なコスト構造を反映している。
+4. **Lean 側スキャン (scan Δ) は安価**: ~0.03–0.04 ns/byte (~25–30 GB/s)。decode の「全バイト走査」部分は memcpy と同オーダーで、マーシャルの支配項は alloc+copy 側。
+
+### §4b との関係 (FFI コストの全体像)
+
+| 入力形態 | 越境あたりのコスト | スケール |
+|---|---|---|
+| プリミティブ `UInt64` (§4b) | ~1.9 ns | サイズ非依存 (定数) |
+| `ByteArray` マーシャル (本節) | 25 ns 〜 14 ms | **O(payload size)** |
+
+「FFI は速い」は **プリミティブ境界に限った話**。データを渡すとコストは渡すバイト数に線形になる。
+
+> **spec スケールでの補正 (§4d 参照)**: 上表の N=10K 以上 (≥586 KB) は `VALIDATOR_REGISTRY_LIMIT = 4096` を超える非物理サイズ。このモデルの payload 上限は V=4096 ⇒ **≤ 240 KB** で、そこでの marshal は **≤ 6.8 µs** = 誤差。「14 ms@57 MB」は到達不能な規模の一般特性であり、実運用 marshal は無視できる。本節の大サイズ行は境界の size-scaling 特性の参考値として残す。
+
+### 限界
+
+- **正準 SSZ ではない**: フラットな代表バッファで、可変長フィールドの offset や型付きデコードは含まない。型付き `State` への decode を入れると scan Δ 側が増えるが、マーシャル (alloc+memcpy) の支配性は変わらない見込み (issue #4 で要確認)。
+- **片道のみ**: 結果 `State` のエンコード + 復路は未計測。実運用は往復なので概ね 2 倍が目安。
+- **zero-copy の余地**: Lean が呼び出し中に読むだけなら borrowed pointer 受けで memcpy を回避できる可能性 (§4b 限界参照)。本計測は owned-copy 前提の上限値。
+
+### 再現
+
+```bash
+cd consensus-lean4 && lake build ConsensusLean4:static
+cd rust-ffi && cargo build --release --bin bench-ffi-marshal
+target/release/bench-ffi-marshal
+```
+
+## 4d. End-to-end SSZ-bytes パイプライン 追測 (2026-06-04)
+
+§4b/§4c は「①marshal」だけを測り、「②decode → ③純粋関数」が未接続だった。本節でその全経路を繋いだ ——`ByteArray` を**型付き `State`/`Block` にデコードし、純粋 `stateTransitionFast` に渡す**。`bench-ffi-ssz` (`rust-ffi/src/bin/bench-ffi-ssz.rs`) + `ConsensusLean4/Ffi.lean` M7。
+
+- **コーデック**: フラットな length-prefixed バイナリ (正準 SSZ ではない) を Lean decode (`decodeState`/`decodeBlock`) と Rust serializer (`serialize_fixture`) で round-trip。`State`/`Block` の全フィールドを網羅。**`hash_tree_root`/SHA は不使用** (decode は純粋なバイト配置)。
+- **fixture は §1 と byte-for-byte 一致**: `buildBenchState(n)`/`buildBenchBlock(n)` と同一内容を直列化。よって decode 後の入力は §1 のスカラー生成版と等価で、STF コストを直接比較できる。
+- **正当性ゲート**: `csf_bench_state_transition_ssz_run` が全 N で sentinel **0 (Ok)** を返すことを assert。誤ったコーデックなら sentinel が変わるかクラッシュするため、これがパイプライン全体の正当性検証になっている。
+- **分解**: marshal = `_marshal_noop`、decode = `_ssz_decode` − marshal、STF = `_ssz_run` − `_ssz_decode`。
+
+### V の上限 = 4096 (重要)
+
+V (validator 数) は **`VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096`** で上限が決まる。これは leanSpec 正準値 (`lean_spec/types/participation.py:11`: `Uint64(2**12)`) であり、`consensus-lean4` の `types.VALIDATOR_REGISTRY_LIMIT` (`Funs/Types.lean`) も同値。`checkpoint_sync` は `validator_count > VALIDATOR_REGISTRY_LIMIT` の state を拒否する。
+
+実運用 V はさらに小さく、**leanSpec のベースラインは 4** (テストは 4/8)。よって計測軸は **devnet baseline (4) → spec 上限 (4096)** とする。
+
+> **訂正**: 本節の旧版は N=100〜1,000,000 で測っていたが、**10,000 以上は spec 上限 4096 を超える非物理値** (mainnet beacon chain の規模を誤って持ち込んだもの)。以下は spec 準拠の軸での再測値。
+
+### 計測結果 (spec-realistic V = 4 … 4096、3 回中央値)
+
+| V | payload | marshal | decode | STF | total (e2e) |
+|---:|---:|---:|---:|---:|---:|
+| 4 (devnet baseline) | 0.6 KB | 34 ns | 9.4 µs | 42 µs | **51 µs** |
+| 8 | 0.8 KB | 35 ns | 13 µs | 42 µs | **56 µs** |
+| 64 | 4.1 KB | 86 ns | 71 µs | 48 µs | **119 µs** |
+| 512 | 30.3 KB | 0.8 µs | 555 µs | 60 µs | **615 µs** |
+| 4096 (spec max) | 240.3 KB | 6.8 µs | 4.6 ms | 0.4 ms | **~5.0 ms** |
+
+(governor 非固定のため total は 3.3〜5.1 ms の run 間ばらつきあり。decode が支配。)
+
+### 判定
+
+1. **実運用域では FFI 全経路が無視できる**。devnet baseline (V=4) で e2e **51 µs**、spec 上限 (V=4096) でも **~5 ms**。1 スロット ~数秒の世界で、状態遷移の marshal+decode+STF は誤差。
+2. **小 V では STF が支配、大 V で decode が逆転**。V=4 では STF 42 µs > decode 9 µs (STF の固定コスト)。V≥512 で decode が上回り、V=4096 で decode 4.6 ms / STF 0.4 ms。交差点は V≈64〜512。
+3. **decode コストは List materialize 由来だが上限内では問題化しない**。~1.1 µs/validator (Aeneas の `pubkey : Array Std.U8 52` = 52 ノード list × V)。V=4096 でも 4.6 ms に留まり、spec 上限を超えない限り catastrophic にならない。
+4. **marshal は常に誤差** (≤ 6.8 µs)。payload は V≤4096 で ≤ 240 KB が上限。§4c の「14 ms@57 MB」は V≈1M 相当で **このモデルでは到達不能**。
+
+### この経路の全体像 (spec 上限 V=4096)
+
+```
+[Rust bytes] ──①marshal──▶ [ByteArray] ──②decode──▶ [typed State/Block] ──③STF──▶ sentinel
+  serialize       6.8µs(誤差)        4.6ms(支配項)            0.4ms
+```
+
+実運用スケールでは「FFI を実データで使う」コストは全部足しても ~5 ms (最悪)。**真のスケール懸念は validator 軸ではなく blocks 軸** —— fork-choice (§2) の O(B²) で、B は `HISTORICAL_ROOTS_LIMIT = 2^18 = 262144` まで伸びうる。decode/marshal の最適化より `compute_lmd_ghost_head_fast` が優先。
+
+### 限界
+
+- フラットコーデックで正準 SSZ wire 非互換 (offset/union 等は未対応)。実 devnet テストベクタとの互換は別途。
+- 片道のみ (結果 `State` のエンコード+復路は未計測)。
+- decode 先が List-backed なのは Aeneas 既定。Array-backed への変更で decode はさらに減るが、上限内 (≤5 ms) で既に十分小さい。
+
+### 再現
+
+```bash
+cd consensus-lean4 && lake build ConsensusLean4:static
+cd rust-ffi && cargo build --release --bin bench-ffi-ssz
+target/release/bench-ffi-ssz            # V = 4, 8, 64, 512, 4096 (spec range)
+```
+
+## 4e. STF 忠実度 — leanSpec `spec.py` 対応と realistic 化の差分
+
+計測対象の `stateTransitionFast` が leanSpec 正準 STF (`src/lean_spec/forks/lstar/spec.py` の `state_transition`, L614) のどこを実装しているかを明記する。**本ベンチの数値は "完全な STF" ではなく以下の被覆範囲に対する値**である点に注意 (= 実 STF コストの下限)。
+
+leanSpec `state_transition` (L614-647) は 4 ステップ:
+
+```python
+def state_transition(state, block, valid_signatures=True):
+    if not valid_signatures: raise              # 1. 署名は前提条件 (検証は外部)
+    advanced  = process_slots(state, block.slot) # 2.
+    new_state = process_block(advanced, block)   # 3. = header + attestations
+    assert block.state_root == hash_tree_root(new_state)  # 4.
+    return new_state
+```
+
+| leanSpec `spec.py` | consensus-lean4 | 状態 |
+|---|---|---|
+| 2. `process_slots` (L135) | `state_transition.process_slots` | ✅ 実装 |
+| 3. `process_block` (L332) | `processBlockFast` | ✅ 実装 |
+| ├ `process_block_header` (L195) | `state_transition.process_block_header` | ✅(内部 HTR は stub) |
+| └ `process_attestations` (L385) | `processAttestationsFast` + `try_finalize` | ✅ 実装 |
+| 4. `hash_tree_root` 照合 (L644) | `hash_tree_root_state`→`eq`→`StateRootMismatch` | ⚠️ 枠のみ。HTR は `ok H256.ZERO` stub |
+| 1. `valid_signatures` 前提 (L634) | — | ❌ 引数なし(常に valid 扱い) |
+| `verify_signatures` (L864, 別メソッド) | — | ❌ 完全欠如 |
+
+→ **`state_transition` 本体の step 2・3 は完全、step 4 は構造のみ実装済み。** 欠けているのは関数外の署名検証と、step 4 の実ハッシュ。
+
+### realistic STF への差分(実装先つき)
+
+| # | 欠けている処理 | 実装先 | 備考 |
+|---|---|---|---|
+| ① | `verify_signatures` (L864): 提案者 + 集約署名 (XMSS) | **Rust/FFI**(leanSig/leanMultisig, Plonky3) + 段取りは Lean | leanSpec では STF の外。最大コスト |
+| ② | 実 `hash_tree_root` (step 4 / header 内) | merkleize 構造=**Lean**、**Poseidon1** 置換=Rust/FFI or Lean | leanSpec は **Poseidon1/KoalaBear**(SHA-256 ではない) |
+| ③ | 非空 attestation/justification 入力 | データ(leanSpec テストベクタ) | 現 fixture は空で 3SF 本体が未駆動 |
+| ④ | 正準 SSZ codec | **Lean**(decode) | 現状はフラット自前コーデック |
+| ⑤ | マルチスロット/エポック境界 | **Lean**(既存ロジック) | 入力次第で駆動 |
+
+**信頼境界の原則**: 検証対象ロジック (STF / SSZ decode / merkleize 構造 / 署名検証の段取り) は Lean、重い暗号プリミティブ (Poseidon1 置換, XMSS/集約 ZK 検証) は Rust/FFI。`compute_block_weights` (L1370) は STF ではなく fork-choice(§2 `compute_lmd_ghost_head`)で別系統。
+
+**ベンチ解釈への含意**: §1/§4 の数値は「署名検証なし・HTR=ZERO・attestation 空」での値。realistic STF では ① 署名検証(支配項)+ ② Poseidon HTR が加わり、桁が上がる。現数値は **FFI/decode/STF ロジックの下限**として読むこと。
 
 ## 5. Future work
 

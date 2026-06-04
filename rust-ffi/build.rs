@@ -48,6 +48,22 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=gmp");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lean_lib.display());
+
+    // Compile the marshalling C shim (csf_make_bytearray) against lean.h.
+    // lean_alloc_sarray / lean_sarray_cptr are `static inline`, so they must be
+    // used from C, not linked from Rust. The toolchain include dir is the
+    // sibling of <toolchain>/lib/lean.
+    let lean_include = lean_lib
+        .parent()
+        .and_then(Path::parent)
+        .expect("lean lib dir must be <toolchain>/lib/lean")
+        .join("include");
+    println!("cargo:rerun-if-changed=csf_marshal_shim.c");
+    cc::Build::new()
+        .file("csf_marshal_shim.c")
+        .include(&lean_include)
+        .opt_level(3)
+        .compile("csf_marshal_shim");
 }
 
 fn run_lake_build(repo_root: &Path) {
