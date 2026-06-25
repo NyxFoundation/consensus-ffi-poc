@@ -138,11 +138,11 @@ V–time は単純な線形ではなく、**V 非依存の固定費(床)+ V に�
 
 ![state_transition scaling with baseline, full range incl. out-of-spec V=1M](./assets/bench-htr-results-baseline-full.svg)
 
-#### 外部実装 ethlambda (native Rust) との対照
+#### 別の native Rust 実装との対照
 
-[`lambdaclass/ethlambda`](https://github.com/lambdaclass/ethlambda) は同じ Lean Consensus (3SF) プロトコルの **native Rust** 実装で、spec 定数も一致(`VALIDATOR_REGISTRY_LIMIT = 4096`、`MAX_ATTESTATIONS_DATA = 8`、`HISTORICAL_ROOTS_LIMIT = 262144`)、HTR も SSZ merkleize over **SHA-256**(`libssz_merkle::Sha2Hasher`)。本 poc と同条件(V ≤ 4096、A=8 有効 attestation、HTR 込み)で `crates/blockchain/state_transition::state_transition` を計測した(consistent block を構築、State の clone は計測外、median of N samples、同一マシン 2026-06-26)。
+同じ Lean Consensus (3SF) プロトコルの**独立した native Rust 実装**(spec 定数も一致: `VALIDATOR_REGISTRY_LIMIT = 4096`、`MAX_ATTESTATIONS_DATA = 8`、`HISTORICAL_ROOTS_LIMIT = 262144`、HTR も SSZ merkleize over **SHA-256**)と対照した。本 poc と同条件(V ≤ 4096、A=8 有効 attestation、HTR 込み)でその実装の `state_transition` を計測(consistent block を構築、State の clone は計測外、median of N samples、同一マシン 2026-06-26)。
 
-| V | ethlambda (native Rust) | consensus-ffi-poc (Lean/FFI) | 比 |
+| V | native Rust 実装 | consensus-ffi-poc (Lean/FFI) | 比 |
 |---:|---:|---:|---:|
 | 4 | 61.1 µs | 324 µs | 5.3× |
 | 8 | 67.6 µs | 344 µs | 5.1× |
@@ -150,9 +150,9 @@ V–time は単純な線形ではなく、**V 非依存の固定費(床)+ V に�
 | 512 | 939.7 µs | 3.85 ms | 4.1× |
 | 4096 (spec max) | **7.41 ms** | **26.40 ms** | **3.6×** |
 
-![state_transition: consensus-ffi-poc (Lean/FFI) vs ethlambda (native Rust), V ≤ 4096](./assets/bench-htr-results-spec-ethlambda.svg)
+![state_transition: consensus-ffi-poc (Lean/FFI) vs native-Rust implementation, V ≤ 4096](./assets/bench-htr-results-spec-vs-native-rust.svg)
 
-native Rust の ethlambda が全域で **3.6–5.3× 速い**。差は Aeneas 生成コード + Lean ランタイム + FFI 境界のオーバーヘッドで、これは検証由来ではなく純粋に実装パスのコスト(§前提どおり handwritten fast path でも Lean の `Array`/boxed `lean_object*` を経由する)。**両者とも spec 上限 V=4096 で SLO target 200 ms を大きく下回る**(7.41 ms / 26.40 ms、ともに 🟢)。scaling は両者とも V=512→4096 で ~linear(ethlambda 940 µs→7.41 ms ≈ 7.9×、poc 3.85→26.40 ms ≈ 6.9×)で、§前述の `O(A·V) + HTR merkleize` モデルが実装非依存に効いていることを裏づける。
+native Rust 実装が全域で **3.6–5.3× 速い**。差は Aeneas 生成コード + Lean ランタイム + FFI 境界のオーバーヘッドで、これは検証由来ではなく純粋に実装パスのコスト(§前提どおり handwritten fast path でも Lean の `Array`/boxed `lean_object*` を経由する)。**両者とも spec 上限 V=4096 で SLO target 200 ms を大きく下回る**(7.41 ms / 26.40 ms、ともに 🟢)。scaling は両者とも V=512→4096 で ~linear(native Rust 940 µs→7.41 ms ≈ 7.9×、poc 3.85→26.40 ms ≈ 6.9×)で、§前述の `O(A·V) + HTR merkleize` モデルが実装非依存に効いていることを裏づける。
 
 <details><summary>参考: ZERO スタブとの比較図</summary>
 
