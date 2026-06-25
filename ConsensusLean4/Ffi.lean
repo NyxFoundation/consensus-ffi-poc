@@ -30,6 +30,31 @@ set_option maxHeartbeats 1000000
 @[export csf_ping]
 def csfPing (n : UInt64) : UInt64 := n + 1
 
+/-! ## Real SHA-256 via Rust `@[extern]` (leanSpec `hash_tree_root` primitive).
+
+leanSpec's `hash_tree_root` (spec/crypto/merkleization.py) is SHA-256. The heavy
+primitive is provided by Rust (`csf_sha256_raw`, sha2 crate) behind the
+`csf_sha256` C shim; the SSZ merkleization *structure* (chunking / binary tree /
+mix_in_length) stays in Lean. This declaration is the boundary; the self-test
+below proves the Lean → C shim → Rust path links and computes correctly before
+any merkleization is built on top. -/
+@[extern "csf_sha256"]
+opaque csfSha256 (data : ByteArray) : ByteArray
+
+/-- Self-test: SHA-256("abc") = ba7816bf…20015ad (NIST FIPS-180 vector).
+Returns 0 on match, 1 on mismatch. The Rust harness asserts 0 at startup, which
+verifies the `@[extern]` primitive is wired before relying on it. -/
+@[export csf_selftest_sha256]
+def csfSelftestSha256 (_seed : UInt64) : UInt8 :=
+  let input : ByteArray := ⟨#[0x61, 0x62, 0x63]⟩ -- "abc"
+  let got := csfSha256 input
+  let want : ByteArray := ⟨#[
+    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+    0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+    0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+    0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad]⟩
+  if got.size == 32 && (List.range 32).all (fun i => got.get! i == want.get! i) then 0 else 1
+
 @[inline] private def packStatePipeline
     (r : Aeneas.Std.Result ((core.result.Result Unit state_transition.Error)
         × types.State)) : UInt8 :=

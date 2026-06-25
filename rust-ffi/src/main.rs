@@ -11,6 +11,11 @@
 use std::ffi::c_void;
 use std::ptr;
 
+// Provides `csf_sha256_raw`, called by the `csf_sha256` C shim that Lean's
+// `@[extern "csf_sha256"]` binds to.
+#[path = "sha_extern.rs"]
+mod sha_extern;
+
 #[link(name = "Init_shared")]
 extern "C" {
     fn lean_initialize_runtime_module();
@@ -25,6 +30,7 @@ extern "C" {
     ) -> *mut c_void;
 
     fn csf_ping(n: u64) -> u64;
+    fn csf_selftest_sha256(seed: u64) -> u8;
     fn csf_smoke_state_transition_ok(seed: u64) -> u8;
     fn csf_smoke_state_transition_err(seed: u64) -> u8;
     fn csf_smoke_compute_lmd_ghost_head_empty(seed: u64) -> u8;
@@ -54,6 +60,11 @@ fn main() {
         // M1 carry-over.
         assert_eq!(csf_ping(41), 42);
         println!("[M1] csf_ping(41) = 42 ✓");
+
+        // SHA-256 @[extern] path: Lean → csf_sha256 (C shim) → csf_sha256_raw (Rust/sha2).
+        let sha = csf_selftest_sha256(0);
+        assert_eq!(sha, 0, "SHA-256(\"abc\") @[extern] self-test failed (got {sha})");
+        println!("[sha] csf_selftest_sha256 → 0 ✓ (Lean→C→Rust sha2, NIST \"abc\" vector)");
 
         // M4c stage 2: state_transition pipeline.
         let r_ok = csf_smoke_state_transition_ok(0);
