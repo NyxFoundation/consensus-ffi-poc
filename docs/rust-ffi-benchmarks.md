@@ -126,6 +126,10 @@ log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spe
 
 SHA-256 `hash_tree_root` 込みの STF pipeline。spec 上限 V=4096 で 26.40 ms ≪ SLO target 200 ms(約 1/8)。赤の破線・網掛けは out-of-spec の V=1M(mainnet 参考、`--include-1m`)で **14.64 s**(🔴、RSS +1.27 GB) — `validator_count > 4096` は leanSpec モデルでは到達不能。HTR が実計算になったことで 1M の merkleize(1M validator を SHA-256 で畳む)が支配し、HTR スタブ時の 4.17 s から ~3.5× に増えた。データは 1 プロセスの canonical run(2026-06-26, AMD Ryzen 9 PRO 8945HS)。
 
+上図は V=1M を含むため spec 範囲(V ≤ 4096)の曲線が縦軸の下端に圧縮される。spec 範囲だけを拡大した版が下図(同一データ、軸を 200 ms SLO 近傍までズーム):
+
+![state_transition results (leanSpec range V ≤ 4096)](./assets/bench-htr-results-spec.svg)
+
 <details><summary>参考: ZERO スタブとの比較図</summary>
 
 ![real hash_tree_root cost vs ZERO stub](./assets/htr-cost.svg)
