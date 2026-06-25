@@ -1,6 +1,6 @@
 ---
 title: Rust ↔ Lean 4 FFI ベンチマーク 実測結果
-last_updated: 2026-06-04
+last_updated: 2026-06-25
 tags:
   - benchmark
   - ffi
@@ -120,7 +120,7 @@ A axis scaling check (B=100 fixed):
 elan which lean    # → leanprover-lean4-v4.28.0-rc1
 
 # 2. Lean + Rust ビルド (build.rs が lake build を自動 invoke)
-cd consensus-lean4 && lake build ConsensusLean4:static
+cd consensus-ffi-poc && lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release
 
 # 3. ベンチ実行 (per-cell isolation 推奨: cargo run はせず target/release を直接呼ぶ)
@@ -164,7 +164,7 @@ target/release/bench-fork-choice --single-cell=100,128
 ### 再現
 
 ```bash
-cd consensus-lean4 && lake build ConsensusLean4:static
+cd consensus-ffi-poc && lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release --bin bench-ffi-overhead
 target/release/bench-ffi-overhead
 ```
@@ -225,7 +225,7 @@ target/release/bench-ffi-overhead
 ### 再現
 
 ```bash
-cd consensus-lean4 && lake build ConsensusLean4:static
+cd consensus-ffi-poc && lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release --bin bench-ffi-marshal
 target/release/bench-ffi-marshal
 ```
@@ -241,7 +241,7 @@ target/release/bench-ffi-marshal
 
 ### V の上限 = 4096 (重要)
 
-V (validator 数) は **`VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096`** で上限が決まる。これは leanSpec 正準値 (`lean_spec/types/participation.py:11`: `Uint64(2**12)`) であり、`consensus-lean4` の `types.VALIDATOR_REGISTRY_LIMIT` (`Funs/Types.lean`) も同値。`checkpoint_sync` は `validator_count > VALIDATOR_REGISTRY_LIMIT` の state を拒否する。
+V (validator 数) は **`VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096`** で上限が決まる。これは leanSpec 正準値 (`lean_spec/types/participation.py:11`: `Uint64(2**12)`) であり、`consensus-ffi-poc` の `types.VALIDATOR_REGISTRY_LIMIT` (`Funs/Types.lean`) も同値。`checkpoint_sync` は `validator_count > VALIDATOR_REGISTRY_LIMIT` の state を拒否する。
 
 実運用 V はさらに小さく、**leanSpec のベースラインは 4** (テストは 4/8)。よって計測軸は **devnet baseline (4) → spec 上限 (4096)** とする。
 
@@ -284,7 +284,7 @@ V (validator 数) は **`VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096`** で上限が�
 ### 再現
 
 ```bash
-cd consensus-lean4 && lake build ConsensusLean4:static
+cd consensus-ffi-poc && lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release --bin bench-ffi-ssz
 target/release/bench-ffi-ssz            # V = 4, 8, 64, 512, 4096 (spec range)
 ```
@@ -304,7 +304,7 @@ def state_transition(state, block, valid_signatures=True):
     return new_state
 ```
 
-| leanSpec `spec.py` | consensus-lean4 | 状態 |
+| leanSpec `spec.py` | consensus-ffi-poc | 状態 |
 |---|---|---|
 | 2. `process_slots` (L135) | `state_transition.process_slots` | ✅ 実装 |
 | 3. `process_block` (L332) | `processBlockFast` | ✅ 実装 |

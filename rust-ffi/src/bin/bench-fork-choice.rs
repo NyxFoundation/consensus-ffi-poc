@@ -28,7 +28,7 @@ extern "C" {
 }
 
 extern "C" {
-    fn initialize_consensus_x2dlean4_ConsensusLean4_Ffi(
+    fn initialize_consensus_x2dffi_x2dpoc_ConsensusLean4_Ffi(
         builtin: u8,
         world: *mut c_void,
     ) -> *mut c_void;
@@ -40,7 +40,7 @@ extern "C" {
 unsafe fn boot_lean() {
     lean_initialize_runtime_module();
     lean_initialize();
-    let _ = initialize_consensus_x2dlean4_ConsensusLean4_Ffi(1, ptr::null_mut());
+    let _ = initialize_consensus_x2dffi_x2dpoc_ConsensusLean4_Ffi(1, ptr::null_mut());
     lean_io_mark_end_initialization();
 }
 
