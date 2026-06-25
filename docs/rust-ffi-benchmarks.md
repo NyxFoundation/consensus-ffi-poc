@@ -35,41 +35,68 @@ tags:
 ## 重要な前提と限界
 
 1. **暗号コストは除外** (A3): `hash_tree_root_*` は ZERO スタブ (`Funs/Types.lean:138-156`)。本物の SSZ ハッシュ計算は加算されない。
-2. **Bench fixture は最小ワークロード** (M5 scope):
-   - `state_transition`: V (= n) validators の State + 0 attestations の Block。`processAttestationsFast` の inner V loop は 0 回 (justifications_roots が空 → cells 空)。N の支配項は `buildBenchValidators` の `List.replicate` + `collapseJustifications` の `R*V = 1*V` flat array allocation。
-   - `compute_lmd_ghost_head`: 線形チェーン B blocks + A attestations が最終 block にすべて投票。`alloc.vec.Vec` が `List`-backed のため、内部の block index は `List.indexOf` ベースで O(B)。
-   - 実運用相当のワークロード (multiple targets, valid checkpoints with real justification windows) は richer fixture を要し本タスクでは対象外。
+2. **Bench fixture は spec 標準ワークロード**:
+   - `state_transition`: V validators の State + **A = `MAX_ATTESTATIONS_DATA` = 8 個の有効 AggregatedAttestation** を載せた Block。`processAttestationsFast` の `O(A·V)` ホットループが実際に走る (§1)。8 票はすべて `voteIsValid` を通り、かつ 2/3 finalize 閾値未満を維持 (fast path 継続)。**旧版は A=0 の空ブロックで構築コストのみを測っていた**ため、本再測で STF 本体に置き換えた。
+   - `compute_lmd_ghost_head`: 線形チェーン B blocks + A attestations が最終 block にすべて投票。`alloc.vec.Vec` が `List`-backed のため、内部の block index は `List.indexOf` ベースで O(B)。**V 軸を持たない** (B blocks / A attestations でスケール、B ≤ `HISTORICAL_ROOTS_LIMIT = 2^18`) ため V 上限の修正対象外で、本再測では §2 の旧値を据え置く。
 3. **paired-delta** はビルド構築コストを差し引く (`@[noinline] consumeState/consumeBlock` で Lean の DCE を抑止して buildonly twin が実際にビルド工程を踏むことを保証)。
 
-## 1. `state_transition` (handwritten Array fast path)
+## 0. spec 定数 (計測軸の根拠)
 
-軸: N (validators), A=64 fixed (block has 0 attestations as noted above).
+計測軸は leanSpec (本プロジェクトが formalize する 3SF-mini) の定数で固定する。値は commit-pin で引用 (drift 防止)。
 
-| N | trials | iters/trial | run median | buildonly | **pipeline (Δ)** | IQR (run) | sentinel |
+leanSpec `main@cb862c0` (2026-06-24), `src/lean_spec/spec/forks/lstar/`:
+
+| 定数 | 値 | 役割 | 出典 |
+|---|---:|---|---|
+| `VALIDATOR_REGISTRY_LIMIT` | `2^12 = 4096` | validator 数 V の上限 (SSZ List LIMIT として強制) | `config.py` |
+| `MAX_ATTESTATIONS_DATA` | `8` | 1 ブロックの distinct AttestationData 上限 (= §1 の A) | `config.py` / `state_transition.py` で強制 |
+| `AggregatedAttestations` LIMIT | `= VALIDATOR_REGISTRY_LIMIT = 4096` | block.attestations リスト長の上限 | `containers/attestation.py` |
+| `ATTESTATION_COMMITTEE_COUNT` | `1` | 1 スロット 1 委員会 | `config.py` |
+| `HISTORICAL_ROOTS_LIMIT` | `2^18 = 262144` | historical block roots / fork-choice B の上限 | `config.py`、Lean `Funs/Types.lean:162` |
+
+`consensus-ffi-poc` の `types.VALIDATOR_REGISTRY_LIMIT` (`Funs/Types.lean:412`) も `4096`、`HISTORICAL_ROOTS_LIMIT` も `262144` で一致。
+
+**mainnet 対照** (ethereum/consensus-specs `master@42b9671`, 2026-06-25): mainnet の `VALIDATOR_REGISTRY_LIMIT = 2^40 ≈ 1.1e12` (実質無制限)、実 V は churn + 経済で動的に決まり現在 **~100 万**。よってベンチの **V=1M は mainnet 実数だが leanSpec モデルでは 4096 の約 244× で非物理**。各ベンチで V=1M は `--include-1m` の「mainnet 範囲外参考値」として明示分離する。
+
+## 1. `state_transition` (handwritten Array fast path, spec-realistic A=8)
+
+軸: **V (validators) ∈ {4, 8, 64, 512, 4096}** = leanSpec の許容範囲 (V ≤ `VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096`、§0 spec 定数表)。ブロックは **A = `MAX_ATTESTATIONS_DATA` = 8 個の有効 AggregatedAttestation** を載せ、`processAttestationsFast` の `O(A·V)` ホットループを**実際に走らせる**。旧版は空ブロック (A=0) で `collapseJustifications` の構築コストのみを測っており STF 本体を踏んでいなかった (前提 §2)。
+
+fixture は `is_valid_vote` / `slot_is_justifiable_after` / `current_proposer` (`Funs/StateTransition.lean`) から逆算した genesis: finalized slot 0、source = (slot 0, `historical[0]`)、target slots {1,2,3,4,5,6,9,12} (すべて justifiable: 1–5 ≤ 5 / 6,12 pronic / 9 平方数)、各 attestation は ⌈V/2⌉ ビットを投票し 2/3 閾値未満を維持 → fast path 継続 (2/3 到達なら Aeneas slow path に bail し別物を測ってしまう)。**Rust harness は計測前に `csf_bench_state_transition_att_cells(64) == 9` を assert** — pipeline 後の `justifications_roots` 長 = zero sentinel + 8 distinct target roots = 9。8 票が確かに有効処理された証拠で、票が skip/bail されると ≠9 で abort し「速いが無意味」な数値を記録させない。
+
+| V | trials | iters/trial | run median | buildonly | **pipeline (Δ)** | IQR (run) | sentinel |
 |---:|---:|---:|---:|---:|---:|---:|:---:|
-| 100 | 5 | 2,714 | 42.2 µs | 884 ns | **41.3 µs** | 4.2 µs | 0 |
-| 1,000 | 5 | 1,974 | 91.6 µs | 15.1 µs | **76.5 µs** | 11.3 µs | 0 |
-| 10,000 | 5 | 179 | 421.1 µs | 140.4 µs | **280.7 µs** | 77.9 µs | 0 |
-| 100,000 | 5 | 34 | 3.32 ms | 1.52 ms | **1.80 ms** | 664.6 µs | 0 |
-| 1,000,000 | 1 | 1 | 35.20 ms | 13.18 ms | **22.02 ms** | n/a | 0 |
+| 4 (devnet baseline) | 5 | 199 | 320.9 µs | 4.0 µs | **316.9 µs** | 15.5 µs | 0 |
+| 8 | 5 | 324 | 334.7 µs | 4.2 µs | **330.5 µs** | 9.9 µs | 0 |
+| 64 | 5 | 198 | 547.0 µs | 10.8 µs | **536.2 µs** | 24.9 µs | 0 |
+| 512 | 5 | 44 | 2.21 ms | 63.1 µs | **2.15 ms** | 46.9 µs | 0 |
+| 4096 (spec max) | 5 | 6 | 15.61 ms | 492.9 µs | **15.12 ms** | 262.6 µs | 0 |
+| 1,000,000 ⚠ mainnet, out-of-spec | 1 | 1 | 4.30 s | 125.8 ms | **4.17 s** | n/a | 0 |
 
-`ru_maxrss` delta:
-- N=100→100K (1 process): **6 MB**
-- N=1M 単独 process: **68 MB** (List.replicate で 1M Validator records の連結リスト)
+`ru_maxrss`:
+- V=4→4096 (1 process): **+数 MB**
+- V=1M 単独 (`--include-1m`, out-of-spec): **+584 MB**。8 本の 1M-bit aggregation 配列 + `R·V = 9·1M` flat 配列が支配。旧空ブロック版 (68 MB) の ~8.6×。さらに List 再帰が 8 MB スタックを溢れさせるため harness は計測を 2 GiB スタックのワーカースレッド上で実行する。
 
 ### 判定 (vs `docs/timing-budget.md` §4 SLO target = <200ms, §3 outer = <800ms)
 
-| N | pipeline | target | outer | 判定 |
+| V | pipeline | target | outer | 判定 |
 |---:|---:|:---:|:---:|:---:|
-| 100 | 41.3 µs | ✓ | ✓ | 🟢 green |
-| 1,000 | 76.5 µs | ✓ | ✓ | 🟢 green |
-| 10,000 | 280.7 µs | ✓ | ✓ | 🟢 green |
-| 100,000 | 1.80 ms | ✓ | ✓ | 🟢 green |
-| 1,000,000 | 22.02 ms | ✓ | ✓ | 🟢 green |
+| 4 | 316.9 µs | ✓ | ✓ | 🟢 green |
+| 8 | 330.5 µs | ✓ | ✓ | 🟢 green |
+| 64 | 536.2 µs | ✓ | ✓ | 🟢 green |
+| 512 | 2.15 ms | ✓ | ✓ | 🟢 green |
+| 4096 (spec max) | 15.12 ms | ✓ | ✓ | 🟢 green |
+| 1,000,000 (out-of-spec) | 4.17 s | ✗ | ✗ | 🔴 red |
 
-→ **N=1M まで全て green** (パイプライン 22ms < target 200ms)。M5 計画が外挿していた値 (N=10K で ~100ms、N=100K で ~1s、N=1M で ~10s) より**2 桁速い**。本 fixture が attestation 処理を踏まないため、計算の支配項が `processAttestationsFast` の inner V loop ではなく `collapseJustifications` の `R*V` flat allocation (R=1, V=N) になっている点に留意 (上記限界 §2)。
+→ **spec 範囲 (V ≤ 4096) は全て green**。最悪の V=4096 でも 15 ms ≪ target 200 ms で、1 スロット ~4 s の世界では attestation 付き STF は余裕。scaling は V=512→4096 (8×) で 2.15→15.1 ms (~7×) ≈ linear (`O(8·V)` のホットループが見えている)、小 V (4/8/64) は ~300–540 µs の固定費 (8 票分の `voteIsValid`: H256 32-byte 比較 ×複数、`isqrt` ループ) が支配。
 
-外挿元の PR #3 fast-path 単独ベンチは attestation あり前提だったので、本数値は handwritten fast path の**構成的下限**(全 V を流す処理時間の floor) を示すと解釈すべき。実運用相当の attestation-rich workload で再測しても N=1M で <200ms を維持する保証はない。
+**mainnet 規模の参考値 V=1M は 4.17 s で red** — これは「計測すべき値」ではなく対照点。leanSpec モデルでは `validator_count > 4096` の state は SSZ 検証で不正であり**到達不能**。加えて List-backed fixture が 2 GiB スタック + 584 MB RSS を要し、約 244× の線形外挿 (15 ms × 244 ≈ 3.7 s) と概ね一致する。**spec が V を 4096 に抑える設計がこの List-backed モデルを tractable に保っている**ことの裏返し。
+
+### スケーリング図 (§1 STF + §1 construction + §4c marshal)
+
+![state_transition scaling: leanSpec V ≤ 4096 vs mainnet 1M](./assets/bench-scaling.svg)
+
+log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spec (V > 4096)。spec 上限 V=4096 でも STF pipeline は 15 ms で SLO target 200 ms の下、marshal は更に 3 桁下。V=1M は両 budget を突破 (4.17 s) し、leanSpec モデルでは到達不能。データは本節 §1 / §4c の実測値 (2026-06-25, AMD Ryzen 9 PRO 8945HS)。
 
 ## 2. `compute_lmd_ghost_head` (Aeneas direct, no fast path)
 
@@ -107,11 +134,11 @@ A axis scaling check (B=100 fixed):
 
 ## 3. 主な観察
 
-1. **`stateTransitionFast` は M5 計画外挿より 2 桁速い**: N=1M で 22 ms (計画 ~10s)。理由は §限界 (2-i) — fixture が attestation 処理を踏まないため、計算支配項が `collapseJustifications` の R*V allocation のみ。**実運用相当 (R≥1 + valid attestations) で再測すれば桁が上がる可能性あり** (future work)。
-2. **`compute_lmd_ghost_head` は B=100 ですら SLO target 超過**: 313ms (A=32) / 1220ms (A=128) vs target 100ms。`Ffi.lean#L61` の "quadratic in blocks" が Lean の List-backed Vec で表面化しており、A 軸は実測 4× linear に従う。mainnet 級 B=32K は外挿で**時間単位**になり、専用 fast path (`compute_lmd_ghost_head_fast`、別 issue 候補) なしには実運用不可。
-3. **build cost (paired-delta の片側) は state_transition で支配的**: N=100K で 1.52 ms / 3.32 ms (run の 46%)、N=1M で 13.18 ms / 35.20 ms (37%)。`List.replicate n + Vec ⟨xs, ...⟩` の strict allocation。paired-delta による減算で正味 pipeline コストを抽出している。
-4. **メモリスケーリング**: state_transition `ru_maxrss` delta は N=100K で 6 MB、N=1M で 68 MB (約 11×、ほぼ N に linear)。`alloc.vec.Vec α := { l : List α // ... }` の List node × N + Validator struct × N が支配。
-5. **2 エントリポイントの実運用域は対極**: `state_transition` (handwritten fast path) は N=1M で余裕の green、`compute_lmd_ghost_head` (Aeneas 直) は B=100 で既に red 隣接の yellow。後者の fast path 実装が実運用への最大ボトルネック。
+1. **spec 範囲の `stateTransitionFast` (A=8) は余裕の green**: V=4096 (spec 上限) で **15 ms** ≪ target 200 ms。8 票の `O(8·V)` ホットループを実際に走らせた値で、旧空ブロック版 (構築コストのみ) の置き換え。V=512→4096 で ~linear (`O(8·V)` が支配)、小 V は 8 票分の `voteIsValid` 固定費 (~300 µs)。
+2. **`compute_lmd_ghost_head` は B=100 ですら SLO target 超過**: 313ms (A=32) / 1220ms (A=128) vs target 100ms。`Ffi.lean` の "quadratic in blocks" が Lean の List-backed Vec で表面化しており、A 軸は実測 4× linear に従う。**V 軸を持たず B (≤ `HISTORICAL_ROOTS_LIMIT = 2^18`) でスケール**するため今回の V 上限再測の対象外。専用 fast path (`compute_lmd_ghost_head_fast`、別 issue 候補) なしには実運用不可。
+3. **build cost (paired-delta の片側) は spec 範囲では小さい**: V=4096 で 493 µs / 15.6 ms (run の ~3%)。A=8 の STF 本体が支配的になり、`List.replicate V + Vec ⟨xs, ...⟩` の構築コストの比率は旧空ブロック版より低下。paired-delta による減算で正味 pipeline コストを抽出。
+4. **メモリ**: spec 範囲 (V ≤ 4096) は `ru_maxrss` delta 数 MB。out-of-spec の V=1M は **+584 MB** (8 本の 1M-bit aggregation + R·V=9M flat) で旧空ブロック 1M (68 MB) の ~8.6×、かつ List 再帰が 8 MB スタックを溢れさせ 2 GiB スタックスレッドを要する。**spec の V≤4096 がこの List-backed モデルを tractable に保つ**。
+5. **2 エントリポイントの実運用域は対極**: `state_transition` (handwritten fast path, A=8) は spec 上限 V=4096 で余裕の green、`compute_lmd_ghost_head` (Aeneas 直) は B=100 で既に red 隣接の yellow。後者の fast path 実装が実運用への最大ボトルネック。
 
 ## 4. 再現手順 (3 ステップ)
 
@@ -124,14 +151,15 @@ cd consensus-ffi-poc && lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release
 
 # 3. ベンチ実行 (per-cell isolation 推奨: cargo run はせず target/release を直接呼ぶ)
-target/release/bench-state-transition                      # N=100,1K,10K,100K (~3 s)
-target/release/bench-state-transition --include-1m         # + N=1M (1 trial、別 process 推奨で N=1M 単独 ~0.1 s + ~70 MB rss)
-target/release/bench-fork-choice                           # B=100 × A=32,128 (~20 s)
+target/release/bench-state-transition                      # V=4,8,64,512,4096, A=8 valid (~4 s)
+target/release/bench-state-transition --include-1m         # + V=1M (out-of-spec ref、1 trial ~4 s + ~584 MB rss、2 GiB stack)
+target/release/bench-ffi-marshal                           # V=1..4096 marshal (~数 s)
+target/release/bench-ffi-marshal --include-1m              # + V=1M (out-of-spec, ~57 MB payload)
+target/release/bench-fork-choice                           # B=100 × A=32,128 (~20 s、V 軸なし)
 target/release/bench-fork-choice --include-1k              # + B=1K × A=32,128 (cell ~6+ 分、計 30 分超)
-target/release/bench-fork-choice --include-10k             # + B=10K × A=32,128 (cell 時間単位、推奨せず)
 
 # Per-cell ru_maxrss isolation (推奨):
-target/release/bench-state-transition --single-n=100000
+target/release/bench-state-transition --single-n=4096
 target/release/bench-state-transition --single-n=1000000
 target/release/bench-fork-choice --single-cell=100,32
 target/release/bench-fork-choice --single-cell=100,128
@@ -177,44 +205,43 @@ target/release/bench-ffi-overhead
 
 - `csf_make_bytearray` (C shim, `rust-ffi/csf_marshal_shim.c`): `lean_alloc_sarray` + `memcpy`。`lean_alloc_sarray`/`lean_sarray_cptr` は lean.h で `static inline` のため Rust から直接リンクできず、lean.h に対してコンパイルした C shim 経由で呼ぶ (build.rs が `cc` でビルド)。
 - Lean export 2 種 (`ConsensusLean4/Ffi.lean` M6): `csf_bench_marshal_touch` = 全バイトを XOR-fold (decode スキャンの下限)、`csf_bench_marshal_noop` = 引数を消費するだけ (alloc + memcpy + dec_ref)。差 = Lean 側スキャン。
-- サイズ軸は §1 の N に対応: Validator = pubkey(52)+index(8) = 60 B とし、ペイロード S = N·60。**正準 SSZ ではなく代表サイズのフラットバッファ。** 計測手法は §1/§4b と同様 (target 200ms/trial, 11 試行中央値, `black_box`)。
+- サイズ軸は §1 の V に対応 (Validator = pubkey 52 + index 8 = 60 B、ペイロード S = V·60) で **leanSpec の V ≤ 4096 に揃える** (§0)。**正準 SSZ ではなく代表サイズのフラットバッファ。** `--include-1m` で V=1M (57 MB) を mainnet 範囲外参考として追加。計測手法は §1/§4b と同様 (target 200ms/trial, 11 試行中央値, `black_box`)。
 
-### 計測結果
+### 計測結果 (spec V = 1 … 4096 + 1M 参考)
 
-| N | payload S | marshal (noop) | full (marshal+scan) | scan Δ | marshal GB/s | marshal ns/byte |
+| V | payload S | marshal (noop) | full (marshal+scan) | scan Δ | marshal GB/s | marshal ns/byte |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 60 B | 25.3 ns | 32.3 ns | 7.0 ns | 2.4 | 0.422 |
-| 100 | 5.9 KB | 114 ns | 235 ns | 121 ns | 52.4 | 0.019 |
-| 1,000 | 58.6 KB | 1.32 µs | 2.84 µs | 1.52 µs | 45.5 | 0.022 |
-| 10,000 | 585.9 KB | 20.5 µs | 32.1 µs | 11.6 µs | 29.3 | 0.034 |
-| 100,000 | 5.7 MB | 223 µs | 351 µs | 128 µs | 26.9 | 0.037 |
-| 1,000,000 | 57.2 MB | **14.39 ms** | 16.64 ms | 2.25 ms | 4.2 | 0.240 |
+| 1 | 60 B | 23.7 ns | 31.3 ns | 7.6 ns | 2.5 | 0.394 |
+| 4 | 240 B | 23.9 ns | 29.0 ns | 5.2 ns | 10.1 | 0.099 |
+| 8 | 480 B | 24.1 ns | 34.2 ns | 10.1 ns | 19.9 | 0.050 |
+| 64 | 3.8 KB | 82.4 ns | 148.1 ns | 65.7 ns | 46.6 | 0.021 |
+| 512 | 30.0 KB | 886.2 ns | 1.44 µs | 551.8 ns | 34.7 | 0.029 |
+| 4096 (spec max) | 240.0 KB | **7.00 µs** | 11.45 µs | 4.45 µs | 35.1 | 0.028 |
+| 1,000,000 ⚠ out-of-spec | 57.2 MB | 14.67 ms | 16.82 ms | 2.16 ms | 4.1 | 0.244 |
 
-### 判定 (vs §1 の STF 計算コスト)
+### 判定 (vs §1 の STF 計算コスト, A=8)
 
-| N | marshal (片道) | §1 STF pipeline | marshal / STF |
+| V | marshal (片道) | §1 STF pipeline | marshal / STF |
 |---:|---:|---:|---:|
-| 100 | 114 ns | 41.3 µs | 0.3% |
-| 100,000 | 223 µs | 1.80 ms | 12% |
-| 1,000,000 | **14.39 ms** | 22.02 ms | **65%** |
+| 4 | 23.9 ns | 316.9 µs | 0.008% |
+| 4096 (spec max) | **7.00 µs** | 15.12 ms | **0.05%** |
+| 1,000,000 (out-of-spec) | 14.67 ms | 4.17 s | 0.35% |
 
-→ **§4b の予測どおり、オーバーヘッドはサイズに比例して変化する。**
+→ **spec 範囲ではマーシャルは完全に誤差** (V=4096 で STF の 0.05%)。STF を空ブロックではなく A=8 の実負荷にしたことで STF 側が重くなり、marshal の相対比は §旧版よりさらに小さい。
 
-1. **小サイズ (devnet 相当, validator 数百 = KB 級)**: 100〜1,300 ns。§4b のプリミティブ越境と同様、**実質ノイズ**。SSZ 化しても体感不変。
-2. **大サイズ (mainnet 相当, validator 1M = ~57 MB)**: 片道 **14.4 ms** で、STF 計算本体 (22 ms) の **約 65%**。往復 (入力デコード + 結果エンコード) なら ~29 ms で STF を上回る。**この規模ではマーシャルが支配項の一つになる**。
-3. **スループットの劣化**: 小サイズで ~52 GB/s (L2/L3 内に収まる) → 57 MB で 4.2 GB/s。これは純粋な memcpy 帯域ではなく、**呼び出しごとに 57 MB を新規 alloc → first-touch ページフォルト → memcpy → dec_ref/free** するためで、per-call マーシャルの現実的なコスト構造を反映している。
-4. **Lean 側スキャン (scan Δ) は安価**: ~0.03–0.04 ns/byte (~25–30 GB/s)。decode の「全バイト走査」部分は memcpy と同オーダーで、マーシャルの支配項は alloc+copy 側。
+1. **spec 範囲 (V ≤ 4096, ≤ 240 KB)**: 24 ns 〜 7 µs。§4b のプリミティブ越境同様、STF に対して**実質ノイズ**。SSZ 化しても体感不変。
+2. **1M 参考 (out-of-spec, ~57 MB)**: 片道 **14.7 ms**。これは到達不能な mainnet 規模の size-scaling 特性で、`validator_count > 4096` の state は SSZ 検証で不正 (§1)。境界の帯域特性の参考としてのみ残す。
+3. **スループットの劣化**: 小サイズで ~35–47 GB/s (L2/L3 内に収まる) → 57 MB で 4.1 GB/s。これは純粋な memcpy 帯域ではなく、**呼び出しごとに新規 alloc → first-touch ページフォルト → memcpy → dec_ref/free** するためで、per-call マーシャルの現実的なコスト構造を反映している。
+4. **Lean 側スキャン (scan Δ) は安価**: ~0.03 ns/byte (~30 GB/s)。decode の「全バイト走査」部分は memcpy と同オーダーで、マーシャルの支配項は alloc+copy 側。
 
 ### §4b との関係 (FFI コストの全体像)
 
 | 入力形態 | 越境あたりのコスト | スケール |
 |---|---|---|
 | プリミティブ `UInt64` (§4b) | ~1.9 ns | サイズ非依存 (定数) |
-| `ByteArray` マーシャル (本節) | 25 ns 〜 14 ms | **O(payload size)** |
+| `ByteArray` マーシャル (本節, spec 範囲) | 24 ns 〜 7 µs | **O(payload size)** |
 
-「FFI は速い」は **プリミティブ境界に限った話**。データを渡すとコストは渡すバイト数に線形になる。
-
-> **spec スケールでの補正 (§4d 参照)**: 上表の N=10K 以上 (≥586 KB) は `VALIDATOR_REGISTRY_LIMIT = 4096` を超える非物理サイズ。このモデルの payload 上限は V=4096 ⇒ **≤ 240 KB** で、そこでの marshal は **≤ 6.8 µs** = 誤差。「14 ms@57 MB」は到達不能な規模の一般特性であり、実運用 marshal は無視できる。本節の大サイズ行は境界の size-scaling 特性の参考値として残す。
+「FFI は速い」は **プリミティブ境界に限った話**。データを渡すとコストは渡すバイト数に線形になるが、spec 上限 (V=4096 ⇒ payload ≤ 240 KB) では **≤ 7 µs** で STF の 0.05% に過ぎない。表末尾の「14 ms@57 MB」は `VALIDATOR_REGISTRY_LIMIT = 4096` を超える到達不能な mainnet 規模の size-scaling 特性であり、実運用 marshal は無視できる。
 
 ### 限界
 
@@ -235,7 +262,7 @@ target/release/bench-ffi-marshal
 §4b/§4c は「①marshal」だけを測り、「②decode → ③純粋関数」が未接続だった。本節でその全経路を繋いだ ——`ByteArray` を**型付き `State`/`Block` にデコードし、純粋 `stateTransitionFast` に渡す**。`bench-ffi-ssz` (`rust-ffi/src/bin/bench-ffi-ssz.rs`) + `ConsensusLean4/Ffi.lean` M7。
 
 - **コーデック**: フラットな length-prefixed バイナリ (正準 SSZ ではない) を Lean decode (`decodeState`/`decodeBlock`) と Rust serializer (`serialize_fixture`) で round-trip。`State`/`Block` の全フィールドを網羅。**`hash_tree_root`/SHA は不使用** (decode は純粋なバイト配置)。
-- **fixture は §1 と byte-for-byte 一致**: `buildBenchState(n)`/`buildBenchBlock(n)` と同一内容を直列化。よって decode 後の入力は §1 のスカラー生成版と等価で、STF コストを直接比較できる。
+- **fixture は空ブロック (A=0) 版**: `buildBenchState(n)`/`buildBenchBlock(n)` (attestations 空) と byte-for-byte 一致。**§1 の A=8 有効投票ワークロードとは別物**で、ここでの STF は構築コスト寄りの A=0 経路 (marshal/decode コストの相対比較が目的のため意図的に軽い fixture を使う)。A=8 経路の SSZ e2e は将来課題。
 - **正当性ゲート**: `csf_bench_state_transition_ssz_run` が全 N で sentinel **0 (Ok)** を返すことを assert。誤ったコーデックなら sentinel が変わるかクラッシュするため、これがパイプライン全体の正当性検証になっている。
 - **分解**: marshal = `_marshal_noop`、decode = `_ssz_decode` − marshal、STF = `_ssz_run` − `_ssz_decode`。
 

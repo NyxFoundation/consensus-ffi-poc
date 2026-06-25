@@ -1,6 +1,6 @@
 ---
 title: 実運用 timing 予算リファレンス
-last_updated: 2026-05-05
+last_updated: 2026-06-25
 tags:
   - timing
   - budget
@@ -25,6 +25,8 @@ M5 ベンチ ([`docs/ffi-implementation-plan.md`](./ffi-implementation-plan.md) 
 
 将来 spec が更新されても、本 doc の数値は当該 SHA 時点で固定される。本 doc の `last_updated` を更新する際は SHA も併せて更新する。
 
+> **spec 進化メモ (2026-06-25)**: 本 §1 は `941abe7` 時点の凍結スナップショット。その後 leanSpec は (a) 設定ファイルを `src/lean_spec/subspecs/chain/config.py` → `src/lean_spec/spec/forks/lstar/config.py` に再編、(b) `MAX_ATTESTATIONS_DATA` を **16 → 8** に変更した (`cb862c0`, 2026-06-24)。**ベンチが使う現行の spec 定数は `docs/rust-ffi-benchmarks.md` §0 に `cb862c0` ピンで集約**してある。本 §1 は凍結ポリシーに従い `941abe7` の値を保持しつつ、変更点のみ下表に注記する。
+
 ## 1. leanSpec spec 定数 (本プロジェクトが formalize する仕様)
 
 出典: [`leanSpec@941abe7:src/lean_spec/subspecs/chain/config.py`](https://github.com/leanEthereum/leanSpec/blob/941abe7ba6d7ea81b5e0beb2eb6b7d4b8fcd08b8/src/lean_spec/subspecs/chain/config.py)
@@ -37,7 +39,7 @@ M5 ベンチ ([`docs/ffi-implementation-plan.md`](./ffi-implementation-plan.md) 
 | `MILLISECONDS_PER_INTERVAL` | 800 | [L39](https://github.com/leanEthereum/leanSpec/blob/941abe7ba6d7ea81b5e0beb2eb6b7d4b8fcd08b8/src/lean_spec/subspecs/chain/config.py#L39) |
 | `GOSSIP_DISPARITY_INTERVALS` | 1 (~800ms) | [L23](https://github.com/leanEthereum/leanSpec/blob/941abe7ba6d7ea81b5e0beb2eb6b7d4b8fcd08b8/src/lean_spec/subspecs/chain/config.py#L23) |
 | `JUSTIFICATION_LOOKBACK_SLOTS` | 3 | [L42](https://github.com/leanEthereum/leanSpec/blob/941abe7ba6d7ea81b5e0beb2eb6b7d4b8fcd08b8/src/lean_spec/subspecs/chain/config.py#L42) |
-| `MAX_ATTESTATIONS_DATA` | 16 / block | [L56](https://github.com/leanEthereum/leanSpec/blob/941abe7ba6d7ea81b5e0beb2eb6b7d4b8fcd08b8/src/lean_spec/subspecs/chain/config.py#L56) |
+| `MAX_ATTESTATIONS_DATA` | 16 / block (941abe7) → **8 (現行 cb862c0)** | [L56@941abe7](https://github.com/leanEthereum/leanSpec/blob/941abe7ba6d7ea81b5e0beb2eb6b7d4b8fcd08b8/src/lean_spec/subspecs/chain/config.py#L56) / [現行](https://github.com/leanEthereum/leanSpec/blob/cb862c01e56ef9b95d69f77cc97746a0fa06010c/src/lean_spec/spec/forks/lstar/config.py#L58) |
 
 ## 2. Slot 内 schedule
 

@@ -11,12 +11,15 @@
 //   * `csf_bench_marshal_noop`  — consumes the arg only (alloc + memcpy + dec_ref)
 // per-call(touch) − per-call(noop) = the Lean-side byte scan.
 //
-// Size axis is keyed to the §1 validator count N: a Validator here is
-// pubkey(52) + index(8) = 60 bytes, so payload S = N * 60. This is a flat
-// representative buffer, NOT canonical SSZ — no codec, no hash_tree_root/SHA.
-// Methodology mirrors the other harnesses: calibrate iters to ~200ms/trial,
-// median of 11 trials, black_box to defeat DCE.
+// Size axis is keyed to the §1 validator count V (Validator = pubkey 52 +
+// index 8 = 60 bytes, so payload S = V * 60) and bounded by leanSpec's
+// VALIDATOR_REGISTRY_LIMIT = 4096. This is a flat representative buffer, NOT
+// canonical SSZ — no codec, no hash_tree_root/SHA. Pass `--include-1m` to add
+// V=1M as a mainnet out-of-spec reference (real beacon chain ~1M validators,
+// unreachable in this model). Methodology mirrors the other harnesses:
+// calibrate iters to ~200ms/trial, median of 11 trials, black_box to defeat DCE.
 
+use std::env;
 use std::ffi::c_void;
 use std::hint::black_box;
 use std::ptr;
@@ -49,7 +52,8 @@ unsafe fn boot_lean() {
 }
 
 const VALIDATOR_BYTES: usize = 60; // pubkey(52) + index(8)
-const N_AXIS: &[u64] = &[1, 100, 1_000, 10_000, 100_000, 1_000_000];
+const N_AXIS: &[u64] = &[1, 4, 8, 64, 512, 4096]; // leanSpec V range (≤ VALIDATOR_REGISTRY_LIMIT)
+const REFERENCE_N: u64 = 1_000_000; // mainnet out-of-spec reference (opt-in via --include-1m)
 const TARGET_TRIAL: Duration = Duration::from_millis(200);
 const TRIALS: usize = 11;
 
@@ -115,20 +119,31 @@ fn gbps(bytes: usize, ns: f64) -> f64 {
 }
 
 fn main() {
+    let include_1m = env::args().any(|s| s == "--include-1m");
+
     unsafe { boot_lean(); }
 
     // Sanity: a 3-byte ByteArray {1,2,3} XOR-folds to 0.
     let probe = unsafe { csf_bench_marshal_touch(csf_make_bytearray([1u8, 2, 3].as_ptr(), 3)) };
     assert_eq!(probe, 0, "XOR-fold of {{1,2,3}} should be 0, got {probe}");
 
+    let axis: Vec<u64> = N_AXIS
+        .iter()
+        .copied()
+        .chain(if include_1m { Some(REFERENCE_N) } else { None })
+        .collect();
+
     println!("# FFI marshalling cost (Rust→Lean ByteArray, no SSZ codec / no SHA)");
     println!();
-    println!("Validator = {VALIDATOR_BYTES} B (pubkey 52 + index 8); payload S = N · {VALIDATOR_BYTES}.");
+    println!(
+        "Validator = {VALIDATOR_BYTES} B (pubkey 52 + index 8); payload S = V · {VALIDATOR_BYTES}. \
+         V ≤ leanSpec VALIDATOR_REGISTRY_LIMIT=4096."
+    );
     println!();
-    println!("| N | payload S | marshal (noop) | full (marshal+scan) | scan Δ | marshal GB/s | marshal ns/byte |");
+    println!("| V | payload S | marshal (noop) | full (marshal+scan) | scan Δ | marshal GB/s | marshal ns/byte |");
     println!("|---:|---:|---:|---:|---:|---:|---:|");
 
-    for &n in N_AXIS {
+    for &n in &axis {
         let s = (n as usize) * VALIDATOR_BYTES;
         // Distinct, non-zero content so memcpy/scan can't be elided as a zero page.
         let buf: Vec<u8> = (0..s).map(|i| (i as u8).wrapping_mul(31).wrapping_add(7)).collect();
@@ -140,9 +155,15 @@ fn main() {
         let marshal_gbps = if s > 0 { gbps(s, noop) } else { 0.0 };
         let marshal_npb = if s > 0 { noop / s as f64 } else { 0.0 };
 
+        let note = if n > 4096 {
+            " ⚠ mainnet, out-of-spec (> 4096)"
+        } else {
+            ""
+        };
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} |",
+            "| {}{} | {} | {} | {} | {} | {} | {} |",
             n,
+            note,
             fmt_bytes(s),
             fmt_ns(noop),
             fmt_ns(full),

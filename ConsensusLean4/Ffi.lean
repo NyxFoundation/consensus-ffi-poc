@@ -313,6 +313,106 @@ def csfBenchComputeLmdGhostHeadBuildOnly
   let atts := buildForkChoiceAttestations b a
   consumeBlocksVec blocks ^^^ consumeAttsVec atts
 
+/-! ## M5b — spec-realistic attestation workload (A = MAX_ATTESTATIONS_DATA = 8).
+
+The §1 `csf_bench_state_transition_*` fixture runs a block with **zero**
+attestations, so `processAttestationsFast`'s O(A·V) hot loop never executes — it
+measures only validator-Vec construction, not the STF body. This fixture loads
+the block with the leanSpec maximum of 8 distinct, *valid* AggregatedAttestations
+so the fast path actually runs.
+
+The genesis is reverse-engineered from `is_valid_vote` / `slot_is_justifiable_after`
+/ `current_proposer` (Funs/StateTransition.lean) so all 8 votes pass `voteIsValid`
+and stay under the 2/3 finalize threshold (which would otherwise bail to the
+Aeneas slow path and measure the wrong thing):
+  * finalized slot F = 0; source = (slot 0, historical[0]); slot 0 ≤ F ⇒ justified.
+  * 8 targets at slots {1,2,3,4,5,6,9,12}: each > F and `slot_is_justifiable_after`
+    (1–5 are ≤ 5, 6/12 are pronic, 9 is a perfect square); `justified_slots`
+    starts empty ⇒ every target slot is unjustified.
+  * historical[i] = hashOfNat i (non-zero, distinct) ⇒ `checkpoint_exists` holds
+    for both source and every target.
+  * each `aggregation_bits` sets ⌈V/2⌉ of V bits: yes = ⌈V/2⌉ < 2/3·V ⇒ no bail,
+    yet the inner loop still scans all V bits (the O(8·V) cost we want to measure).
+  * block at slot 13 with `latest_block_header.slot` = 12 ⇒ `num_empty_slots` = 0,
+    so `process_block_header` appends exactly one (ZERO) historical entry and the
+    pre-seeded indices 0..12 stay intact. -/
+
+private def attTargetSlots : List Nat := [1, 2, 3, 4, 5, 6, 9, 12]
+
+private def buildAttHistorical : alloc.vec.Vec types.H256 :=
+  buildVecFromList ((List.range 13).map hashOfNat) (alloc.vec.Vec.new types.H256)
+
+private def buildAttBits (n : Nat) : alloc.vec.Vec Bool :=
+  let half := (n + 1) / 2
+  buildVecFromList (List.replicate half true ++ List.replicate (n - half) false)
+    (alloc.vec.Vec.new Bool)
+
+private def buildAttestation (n : Nat) (t : Nat) : types.AggregatedAttestation :=
+  let source : types.Checkpoint := { root := hashOfNat 0, slot := 0#u64 }
+  let target : types.Checkpoint :=
+    { root := hashOfNat t, slot := u64OfUInt64 (UInt64.ofNat t) }
+  { aggregation_bits := buildAttBits n
+    data := { slot := target.slot, head := target, target := target, source := source } }
+
+private def buildAttAttestations (n : Nat) :
+    alloc.vec.Vec types.AggregatedAttestation :=
+  buildVecFromList (attTargetSlots.map (buildAttestation n))
+    (alloc.vec.Vec.new types.AggregatedAttestation)
+
+private def buildBenchStateAtt (n : UInt64) : types.State :=
+  let finalizedCp : types.Checkpoint := { root := hashOfNat 0, slot := 0#u64 }
+  let header12 : types.BlockHeader :=
+    { slot := 12#u64
+      proposer_index := 0#u64
+      parent_root := types.H256.ZERO
+      state_root := types.H256.ZERO
+      body_root := types.H256.ZERO }
+  { config := { genesis_time := 0#u64 }
+    slot := 12#u64
+    latest_block_header := header12
+    latest_justified := finalizedCp
+    latest_finalized := finalizedCp
+    historical_block_hashes := buildAttHistorical
+    justified_slots := alloc.vec.Vec.new Bool
+    validators := buildBenchValidators n.toNat
+    justifications_roots := alloc.vec.Vec.new types.H256
+    justifications_validators := alloc.vec.Vec.new Bool }
+
+private def buildBenchBlockAtt (n : UInt64) : types.Block :=
+  -- Proposer for slot 13 = 13 % V (current_proposer = slot % num_validators).
+  let proposerRaw : UInt64 := if n = 0 then 0 else 13 % n
+  { slot := 13#u64
+    proposer_index := u64OfUInt64 proposerRaw
+    parent_root := types.H256.ZERO
+    state_root := types.H256.ZERO
+    body := { attestations := buildAttAttestations n.toNat } }
+
+/-- Build the V-validator genesis + 8-valid-vote block and run the fast pipeline.
+The `_a` slot is the fixed spec attestation count (8); it is ignored here because
+the count is baked into `attTargetSlots`, but kept in the signature so the Rust
+harness plumbing stays uniform with the other bench entry points. -/
+@[export csf_bench_state_transition_att_run]
+def csfBenchStateTransitionAttRun (n _a _seed : UInt64) : UInt8 :=
+  packStatePipeline
+    (ConsensusLean4.FastPath.stateTransitionFast
+      (buildBenchStateAtt n) (buildBenchBlockAtt n))
+
+/-- Paired-delta twin: build the same State + Block, skip the pipeline. -/
+@[export csf_bench_state_transition_att_buildonly]
+def csfBenchStateTransitionAttBuildOnly (n _a _seed : UInt64) : UInt8 :=
+  consumeState (buildBenchStateAtt n) ^^^ consumeBlock (buildBenchBlockAtt n)
+
+/-- Verification probe: `justifications_roots` length after the pipeline. With all
+8 votes processed (none skipped, no 2/3 bail) the serialiser prepends a ZERO
+sentinel root ⇒ length 9. The Rust harness asserts this before timing so a broken
+fixture (silently-skipped votes) can never be measured as a fast result. -/
+@[export csf_bench_state_transition_att_cells]
+def csfBenchStateTransitionAttCells (n : UInt64) : UInt8 :=
+  match ConsensusLean4.FastPath.stateTransitionFast
+      (buildBenchStateAtt n) (buildBenchBlockAtt n) with
+  | .ok (_, s) => (min s.justifications_roots.val.length 255).toUInt8
+  | _          => 0
+
 /-! ## M6 — FFI marshalling cost.
 
 The §1/§2 benches cross only primitive `UInt64`, so they measure Lean-side

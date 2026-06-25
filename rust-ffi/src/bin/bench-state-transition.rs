@@ -1,12 +1,17 @@
-// M5 — state_transition N-axis bench harness.
+// M5b — state_transition V-axis bench harness (spec-realistic).
 //
-// Drives `csf_bench_state_transition_run` and its `_buildonly` paired-delta
-// twin across the N axis defined in docs/ffi-implementation-plan.md M5.
-// Builders live entirely on the Lean side (cf. ConsensusLean4/Ffi.lean
-// preamble) so the harness only passes primitive `u64` arguments.
+// Drives `csf_bench_state_transition_att_run` and its `_buildonly` paired-delta
+// twin. The block carries A = MAX_ATTESTATIONS_DATA = 8 *valid* attestations so
+// the O(A·V) fast path (processAttestationsFast) actually runs — unlike the
+// earlier empty-block fixture, which measured only validator-Vec construction.
+// Builders live entirely on the Lean side (cf. ConsensusLean4/Ffi.lean M5b
+// section) so the harness only passes primitive `u64` arguments.
 //
-// Default cells: N ∈ {100, 1K, 10K, 100K} × 5 trials, A=64 fixed.
-// Pass `--include-1m` to add N=1M with 1 trial (reference value).
+// V axis is leanSpec-bounded: VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096
+// (forks/lstar/config.py). Default cells: V ∈ {4, 8, 64, 512, 4096} × 5 trials.
+// Pass `--include-1m` to add V=1M with 1 trial — a *mainnet out-of-spec
+// reference* (real beacon chain ~1M validators), physically unreachable in this
+// model where state with validator_count > 4096 fails SSZ validation.
 // Pass `--single-n=N` to run only one cell — used for per-process
 // `ru_maxrss` isolation as required by docs/ffi-feasibility.md A10.
 
@@ -28,8 +33,11 @@ extern "C" {
         world: *mut c_void,
     ) -> *mut c_void;
 
-    fn csf_bench_state_transition_run(n: u64, a: u64, seed: u64) -> u8;
-    fn csf_bench_state_transition_buildonly(n: u64, a: u64, seed: u64) -> u8;
+    fn csf_bench_state_transition_att_run(n: u64, a: u64, seed: u64) -> u8;
+    fn csf_bench_state_transition_att_buildonly(n: u64, a: u64, seed: u64) -> u8;
+    // Verification probe: justifications_roots length after the pipeline.
+    // 8 valid votes processed (no skip, no 2/3 bail) ⇒ 9 (incl. zero sentinel).
+    fn csf_bench_state_transition_att_cells(n: u64) -> u8;
 }
 
 unsafe fn boot_lean() {
@@ -39,10 +47,10 @@ unsafe fn boot_lean() {
     lean_io_mark_end_initialization();
 }
 
-const A_FIXED: u64 = 64;
+const A_FIXED: u64 = 8; // spec MAX_ATTESTATIONS_DATA (distinct AttestationData / block)
 const TARGET_TRIAL_DURATION: Duration = Duration::from_millis(100);
-const DEFAULT_N_AXIS: &[u64] = &[100, 1_000, 10_000, 100_000];
-const REFERENCE_N: u64 = 1_000_000;
+const DEFAULT_N_AXIS: &[u64] = &[4, 8, 64, 512, 4096]; // leanSpec V range (≤ VALIDATOR_REGISTRY_LIMIT)
+const REFERENCE_N: u64 = 1_000_000; // mainnet out-of-spec reference (opt-in via --include-1m)
 
 fn fmt_duration_ns(ns: u128) -> String {
     if ns < 1_000 {
@@ -66,12 +74,12 @@ fn calibrate_iters(n: u64, a: u64) -> usize {
     // 5 warmup calls to settle branch predictor / TLB, then time 20 calls
     // and back out an iter count that hits the target trial duration.
     for _ in 0..5 {
-        let _ = unsafe { csf_bench_state_transition_run(n, a, 0) };
+        let _ = unsafe { csf_bench_state_transition_att_run(n, a, 0) };
     }
     const SAMPLE: usize = 20;
     let t0 = Instant::now();
     for k in 0..SAMPLE {
-        let _ = unsafe { csf_bench_state_transition_run(n, a, k as u64) };
+        let _ = unsafe { csf_bench_state_transition_att_run(n, a, k as u64) };
     }
     let elapsed = t0.elapsed();
     let per_call_ns = (elapsed.as_nanos() / SAMPLE as u128).max(1);
@@ -94,7 +102,7 @@ struct CellResult {
 
 fn bench_cell(n: u64, a: u64, trials: usize) -> CellResult {
     // Sentinel sanity: confirm the pipeline returns Ok before timing.
-    let sentinel = unsafe { csf_bench_state_transition_run(n, a, 0) };
+    let sentinel = unsafe { csf_bench_state_transition_att_run(n, a, 0) };
 
     let iters = if trials == 1 { 1 } else { calibrate_iters(n, a) };
     let mut run_per_iter: Vec<u128> = Vec::with_capacity(trials);
@@ -106,7 +114,7 @@ fn bench_cell(n: u64, a: u64, trials: usize) -> CellResult {
         let t0 = Instant::now();
         for k in 0..iters {
             let _ = unsafe {
-                csf_bench_state_transition_run(n, a, seed_base + k as u64)
+                csf_bench_state_transition_att_run(n, a, seed_base + k as u64)
             };
         }
         let elapsed = t0.elapsed();
@@ -115,7 +123,7 @@ fn bench_cell(n: u64, a: u64, trials: usize) -> CellResult {
         let t0 = Instant::now();
         for k in 0..iters {
             let _ = unsafe {
-                csf_bench_state_transition_buildonly(n, a, seed_base + k as u64)
+                csf_bench_state_transition_att_buildonly(n, a, seed_base + k as u64)
             };
         }
         let elapsed = t0.elapsed();
@@ -149,10 +157,21 @@ fn bench_cell(n: u64, a: u64, trials: usize) -> CellResult {
     }
 }
 
+fn spec_note(n: u64) -> &'static str {
+    if n > 4096 {
+        " ⚠ mainnet, out-of-spec (> VALIDATOR_REGISTRY_LIMIT=4096)"
+    } else {
+        ""
+    }
+}
+
 fn print_results_table(results: &[CellResult]) {
-    println!("# state_transition bench (handwritten Array fast path, A={A_FIXED})");
+    println!(
+        "# state_transition bench (Array fast path, A={A_FIXED} valid attestations, \
+         V ≤ leanSpec VALIDATOR_REGISTRY_LIMIT=4096)"
+    );
     println!();
-    println!("| N | trials | iters/trial | run median | buildonly | **pipeline (Δ)** | IQR (run) | sentinel |");
+    println!("| V | trials | iters/trial | run median | buildonly | **pipeline (Δ)** | IQR (run) | sentinel |");
     println!("|---:|---:|---:|---:|---:|---:|---:|:---:|");
     for r in results {
         let iqr = if r.run_iqr_ns > 0 {
@@ -161,8 +180,9 @@ fn print_results_table(results: &[CellResult]) {
             "n/a".to_string()
         };
         println!(
-            "| {} | {} | {} | {} | {} | **{}** | {} | {} |",
+            "| {}{} | {} | {} | {} | {} | **{}** | {} | {} |",
             r.n,
+            spec_note(r.n),
             r.trials,
             r.iters,
             fmt_duration_ns(r.run_median_ns),
@@ -178,7 +198,7 @@ fn print_budget_table(results: &[CellResult]) {
     println!();
     println!("## Budget judgment (per docs/timing-budget.md §5)");
     println!();
-    println!("| N | pipeline | target <200ms | outer <800ms | judgment |");
+    println!("| V | pipeline | target <200ms | outer <800ms | judgment |");
     println!("|---:|---:|:---:|:---:|:---:|");
     for r in results {
         let pipeline_ms = r.pipeline_ns as f64 / 1_000_000.0;
@@ -190,8 +210,9 @@ fn print_budget_table(results: &[CellResult]) {
             (false, false) => "🔴 red",
         };
         println!(
-            "| {} | {} | {} | {} | {} |",
+            "| {}{} | {} | {} | {} | {} |",
             r.n,
+            spec_note(r.n),
             fmt_duration_ns(r.pipeline_ns),
             if target_ok { "✓" } else { "✗" },
             if outer_ok { "✓" } else { "✗" },
@@ -200,7 +221,7 @@ fn print_budget_table(results: &[CellResult]) {
     }
 }
 
-fn main() {
+fn run() {
     let args: Vec<String> = env::args().skip(1).collect();
     let include_1m = args.iter().any(|s| s == "--include-1m");
     let single_n: Option<u64> = args
@@ -209,6 +230,20 @@ fn main() {
         .and_then(|v| v.parse().ok());
 
     unsafe { boot_lean(); }
+
+    // Fixture self-check: the A=8 workload only measures the STF if all 8 votes
+    // are *valid*. After the pipeline `justifications_roots` must hold 9 entries
+    // (zero sentinel + 8 distinct target roots). Anything else means votes were
+    // skipped (invalid) or the 2/3 threshold bailed to the slow path — either way
+    // the timings below would be meaningless, so refuse to measure.
+    let cells = unsafe { csf_bench_state_transition_att_cells(64) };
+    assert_eq!(
+        cells, 9,
+        "valid-vote fixture broken: expected 9 justification roots (zero sentinel + 8 \
+         targets), got {cells} — votes were skipped or the 2/3 threshold bailed"
+    );
+    println!("[fixture] att_cells(V=64) = {cells} ✓ (8 valid votes on the fast path)");
+    println!();
 
     let rss_start = ru_maxrss_kb();
     let t_total = Instant::now();
@@ -243,4 +278,18 @@ fn main() {
     println!("| ru_maxrss start | {} MB |", rss_start / 1024);
     println!("| ru_maxrss end | {} MB |", rss_end / 1024);
     println!("| ru_maxrss delta | {} MB |", (rss_end - rss_start) / 1024);
+}
+
+fn main() {
+    // The A=8 fixture builds Lean `List`-backed structures (validators,
+    // aggregation bitfields, the R·V justification array). At the out-of-spec
+    // V=1M reference these recurse deep enough to blow the 8 MB main-thread
+    // stack, so run everything (including Lean init) on one large-stack worker
+    // thread. Lean's per-thread runtime is initialized inside that thread.
+    std::thread::Builder::new()
+        .stack_size(2 << 30) // 2 GiB; spec range needs far less, 1M needs headroom
+        .spawn(run)
+        .expect("failed to spawn bench worker thread")
+        .join()
+        .expect("bench worker thread panicked");
 }
