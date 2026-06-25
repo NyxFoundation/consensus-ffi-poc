@@ -92,6 +92,12 @@ fixture は `is_valid_vote` / `slot_is_justifiable_after` / `current_proposer` (
 
 **mainnet 規模の参考値 V=1M は 4.17 s で red** — これは「計測すべき値」ではなく対照点。leanSpec モデルでは `validator_count > 4096` の state は SSZ 検証で不正であり**到達不能**。加えて List-backed fixture が 2 GiB スタック + 584 MB RSS を要し、約 244× の線形外挿 (15 ms × 244 ≈ 3.7 s) と概ね一致する。**spec が V を 4096 に抑える設計がこの List-backed モデルを tractable に保っている**ことの裏返し。
 
+### スケーリング図 (§1 STF + §1 construction + §4c marshal)
+
+![state_transition scaling: leanSpec V ≤ 4096 vs mainnet 1M](./assets/bench-scaling.svg)
+
+log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spec (V > 4096)。spec 上限 V=4096 でも STF pipeline は 15 ms で SLO target 200 ms の下、marshal は更に 3 桁下。V=1M は両 budget を突破 (4.17 s) し、leanSpec モデルでは到達不能。データは本節 §1 / §4c の実測値 (2026-06-25, AMD Ryzen 9 PRO 8945HS)。
+
 ## 2. `compute_lmd_ghost_head` (Aeneas direct, no fast path)
 
 軸: (B blocks, A attestations) ∈ `{100} × {32, 128}` × 5 試行 (default)。
