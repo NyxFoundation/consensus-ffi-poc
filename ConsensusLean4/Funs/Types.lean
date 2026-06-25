@@ -4,6 +4,7 @@
 import Aeneas
 import ConsensusLean4.Types
 import ConsensusLean4.FunsExternal
+import ConsensusLean4.Merkleization
 open Aeneas Aeneas.Std Result ControlFlow Error
 set_option linter.dupNamespace false
 set_option linter.hashCommand false
@@ -138,22 +139,26 @@ def types.H256.ZERO : types.H256 := let a := Array.repeat 32#usize 0#u8
 /-- [ethlambda_verification::types::hash_tree_root_state]:
     Source: 'crates/verification/src/types.rs', lines 153:0-155:1
     Visibility: public -/
-def types.hash_tree_root_state (_state : types.State) : Result types.H256 := do
-  ok types.H256.ZERO
+-- PoC: the original Aeneas stub returned `ok H256.ZERO`. Replaced with the real
+-- SSZ hash_tree_root (ConsensusLean4.Merkleization, SHA-256 via Rust @[extern]).
+-- NOTE: this is a generated file — re-running Aeneas overwrites this back to the
+-- ZERO stub; redo this swap (3 functions below) after any regen.
+def types.hash_tree_root_state (state : types.State) : Result types.H256 := do
+  ok (ConsensusLean4.Merkle.hashTreeRootState state)
 
 /-- [ethlambda_verification::types::hash_tree_root_block_body]:
     Source: 'crates/verification/src/types.rs', lines 161:0-163:1
     Visibility: public -/
 def types.hash_tree_root_block_body
-  (_body : types.BlockBody) : Result types.H256 := do
-  ok types.H256.ZERO
+  (body : types.BlockBody) : Result types.H256 := do
+  ok (ConsensusLean4.Merkle.hashTreeRootBlockBody body)
 
 /-- [ethlambda_verification::types::hash_tree_root_block_header]:
     Source: 'crates/verification/src/types.rs', lines 157:0-159:1
     Visibility: public -/
 def types.hash_tree_root_block_header
-  (_header : types.BlockHeader) : Result types.H256 := do
-  ok types.H256.ZERO
+  (header : types.BlockHeader) : Result types.H256 := do
+  ok (ConsensusLean4.Merkle.hashTreeRootBlockHeader header)
 
 /-- [ethlambda_verification::types::HISTORICAL_ROOTS_LIMIT]
     Source: 'crates/verification/src/types.rs', lines 129:0-129:50
