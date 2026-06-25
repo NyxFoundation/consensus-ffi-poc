@@ -121,7 +121,7 @@ log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spe
 
 ![state_transition results with real hash_tree_root](./assets/bench-htr-results.svg)
 
-実 HTR 込みの STF pipeline(青)と Rust→Lean ByteArray marshal の境界コスト(橙)。spec 上限 V=4096 でも STF 29 ms ≪ SLO target 200 ms、marshal は ~4 桁下で実質誤差。データは本節の canonical run(2026-06-26, AMD Ryzen 9 PRO 8945HS)。
+実 HTR 込みの STF pipeline。spec 上限 V=4096 でも 29 ms ≪ SLO target 200 ms(約 1/7)。データは本節の canonical run(2026-06-26, AMD Ryzen 9 PRO 8945HS)。
 
 <details><summary>参考: ZERO スタブとの比較図</summary>
 
