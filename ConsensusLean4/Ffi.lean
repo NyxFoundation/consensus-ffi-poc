@@ -612,3 +612,128 @@ def csfBenchStateTransitionSszDecode (data : ByteArray) : UInt8 :=
   let (state, o) := decodeState data 0
   let (block, _) := decodeBlock data o
   consumeState state ^^^ consumeBlock block
+
+/-! ## Realism probe — scattered aggregation bits + high-entropy roots.
+
+The M5b `*_att_*` fixture sets a *contiguous* ⌈V/2⌉-bit prefix and fills every
+H256 with a single repeated byte. Both make the STF cheaper to *measure* than
+real data would be: the regular bit prefix is near-ideal for the CPU branch
+predictor, and single-byte roots diverge at byte 0 so `H256` comparisons
+short-circuit immediately. This section rebuilds the identical workload (same V,
+same 8 valid votes, same no-bail / `cells = 9` invariant) but
+
+  * scatters the ⌈V/2⌉ set bits with a fixed Fisher-Yates permutation
+    (`mix64` PRNG) so the inner `aggregation_bits` scan is unpredictable, and
+  * fills every H256 with a high-entropy `mix64`-derived byte pattern
+    (`hashOfNatHE`) — non-zero and injective over the historical index.
+
+The vote count stays exactly ⌈V/2⌉ (< 2/3·V for V ≥ 4) so the fast path is
+preserved and `_real_cells` still returns 9. Measuring this against the M5b
+baseline isolates the data-pattern (branch-prediction + comparison) component
+of the timing — the "optimistic bias" of the synthetic fixture. -/
+
+/-- splitmix64 finalizer — deterministic 64-bit avalanche mix. -/
+@[inline] private def mix64 (x : UInt64) : UInt64 :=
+  let z := x + 0x9E3779B97F4A7C15
+  let z := (z ^^^ (z >>> 30)) * 0xBF58476D1CE4E5B9
+  let z := (z ^^^ (z >>> 27)) * 0x94D049BB133111EB
+  z ^^^ (z >>> 31)
+
+/-- High-entropy H256: each byte is a `mix64` output, with byte 0 forced
+non-zero (so `is_zero` is false) and the last byte set to `k` so distinct
+indices yield distinct roots. -/
+private def hashOfNatHE (k : Nat) : types.H256 :=
+  Array.make 32#usize ((List.range 32).map (fun j =>
+    let raw : UInt8 := (mix64 (UInt64.ofNat ((k + 1) * 32 + j))).toUInt8
+    let byte : UInt8 :=
+      if j == 0 then 1 + (raw % 255)
+      else if j == 31 then UInt8.ofNat (k % 256)
+      else raw
+    u8OfUInt8 byte))
+
+/-- Exactly ⌈n/2⌉ set bits, scattered by a fixed Fisher-Yates shuffle so the
+true/false pattern (scanned in index order) is unpredictable to the branch
+predictor. Deterministic: the `mix64` RNG is seeded only by the index. -/
+private def scatteredBitList (n : Nat) : List Bool := Id.run do
+  let half := (n + 1) / 2
+  let mut perm := (List.range n).toArray
+  let mut i := n
+  while i > 1 do
+    i := i - 1
+    let r := (mix64 (UInt64.ofNat (i + 1))).toNat % (i + 1)
+    let tmp := perm[i]!
+    perm := perm.set! i perm[r]!
+    perm := perm.set! r tmp
+  let mut bits := Array.replicate n false
+  let mut k := 0
+  while k < half do
+    bits := bits.set! perm[k]! true
+    k := k + 1
+  pure bits.toList
+
+private def buildAttBitsScattered (n : Nat) : alloc.vec.Vec Bool :=
+  buildVecFromList (scatteredBitList n) (alloc.vec.Vec.new Bool)
+
+private def buildAttHistoricalHE : alloc.vec.Vec types.H256 :=
+  buildVecFromList ((List.range 13).map hashOfNatHE) (alloc.vec.Vec.new types.H256)
+
+private def buildAttestationReal (n : Nat) (t : Nat) : types.AggregatedAttestation :=
+  let source : types.Checkpoint := { root := hashOfNatHE 0, slot := 0#u64 }
+  let target : types.Checkpoint :=
+    { root := hashOfNatHE t, slot := u64OfUInt64 (UInt64.ofNat t) }
+  { aggregation_bits := buildAttBitsScattered n
+    data := { slot := target.slot, head := target, target := target, source := source } }
+
+private def buildAttAttestationsReal (n : Nat) :
+    alloc.vec.Vec types.AggregatedAttestation :=
+  buildVecFromList (attTargetSlots.map (buildAttestationReal n))
+    (alloc.vec.Vec.new types.AggregatedAttestation)
+
+private def buildBenchStateAttReal (n : UInt64) : types.State :=
+  let finalizedCp : types.Checkpoint := { root := hashOfNatHE 0, slot := 0#u64 }
+  let header12 : types.BlockHeader :=
+    { slot := 12#u64
+      proposer_index := 0#u64
+      parent_root := types.H256.ZERO
+      state_root := types.H256.ZERO
+      body_root := types.H256.ZERO }
+  { config := { genesis_time := 0#u64 }
+    slot := 12#u64
+    latest_block_header := header12
+    latest_justified := finalizedCp
+    latest_finalized := finalizedCp
+    historical_block_hashes := buildAttHistoricalHE
+    justified_slots := alloc.vec.Vec.new Bool
+    validators := buildBenchValidators n.toNat
+    justifications_roots := alloc.vec.Vec.new types.H256
+    justifications_validators := alloc.vec.Vec.new Bool }
+
+private def buildBenchBlockAttReal (n : UInt64) : types.Block :=
+  let proposerRaw : UInt64 := if n = 0 then 0 else 13 % n
+  { slot := 13#u64
+    proposer_index := u64OfUInt64 proposerRaw
+    parent_root := types.H256.ZERO
+    state_root := types.H256.ZERO
+    body := { attestations := buildAttAttestationsReal n.toNat } }
+
+/-- Realistic counterpart to `csf_bench_state_transition_att_run`: scattered
+bits + high-entropy roots, otherwise identical. -/
+@[export csf_bench_state_transition_att_real_run]
+def csfBenchStateTransitionAttRealRun (n _a _seed : UInt64) : UInt8 :=
+  let state := buildBenchStateAttReal n
+  let block := mkConsistentBlock state (buildBenchBlockAttReal n)
+  packStatePipeline (ConsensusLean4.FastPath.stateTransitionFast state block)
+
+@[export csf_bench_state_transition_att_real_buildonly]
+def csfBenchStateTransitionAttRealBuildOnly (n _a _seed : UInt64) : UInt8 :=
+  let state := buildBenchStateAttReal n
+  let block := mkConsistentBlock state (buildBenchBlockAttReal n)
+  consumeState state ^^^ consumeBlock block
+
+@[export csf_bench_state_transition_att_real_cells]
+def csfBenchStateTransitionAttRealCells (n : UInt64) : UInt8 :=
+  let state := buildBenchStateAttReal n
+  let block := mkConsistentBlock state (buildBenchBlockAttReal n)
+  match ConsensusLean4.FastPath.stateTransitionFast state block with
+  | .ok (_, s) => (min s.justifications_roots.val.length 255).toUInt8
+  | _          => 0

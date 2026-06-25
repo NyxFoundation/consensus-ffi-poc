@@ -129,6 +129,40 @@ log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spe
 - **att_cells = 9 を維持**: 実 HTR 化後も 8 票はすべて有効処理(root 整合化は投票の有効性に影響しない)。
 - **依然 STF 外**: 署名検証(XMSS/Poseidon)は未計測(§4e ①)。本節は「実 HTR 込み・署名検証なし」の値。
 
+## 1c. データリアリズム A/B — 合成 fixture の楽観バイアス検証
+
+§1/§1b の fixture は attestation の `aggregation_bits` を**連続 ⌈V/2⌉ ビット接頭辞**(`true` が前半に固まる)で、H256 root を**単一バイト 32 連**(`hashOfNat`)で構築する。どちらも STF を実データより*測りやすく*する経路を持つ:
+
+- **分岐予測**: 連続接頭辞は `processAttestationsFast` の `aggregation_bits` 走査(`FastPath.lean:133`)で分岐予測がほぼ完璧に当たる。実 attestation の散らばったビットなら mispredict が増えうる。
+- **比較短絡**: 単一バイト root は相異なる root が**バイト 0 で分岐**するため `H256` 等価比較・`is_zero` が即短絡する。
+
+本節はこれを定量化するため、同一ワークロード(同 V、同 8 有効票、同 no-bail / `cells = 9` 不変)の **data-realistic twin**(`csf_bench_state_transition_att_real_*`)を作って A/B 計測した:
+
+- **散らばったビット**: `mix64`(splitmix64)を RNG とする固定 Fisher-Yates で、**正確に ⌈V/2⌉ 個**の set ビットを無秩序な位置に配置(`scatteredBitList`)。票数は不変なので 2/3 閾値に当たらず fast path を維持。
+- **高エントロピー root**: `mix64` 由来のバイト列(`hashOfNatHE`、非ゼロ・index について injective)。
+- V / A / SHA ブロック数 / 制御パスはすべて baseline と同一 ⇒ **realistic ≥ baseline ならその差が "データパターン由来の楽観バイアス"**。両 fixture とも `_real_cells = 9` を assert してから計測。
+- **同一プロセスで baseline と realistic を各 V で交互計測**(cache/thermal 状態を共有した公平な A/B)。独立 4 プロセス × 各 7 試行中央値。
+
+### 計測結果 (V = 4 … 4096、A=8 valid votes、4 プロセスの中央値)
+
+| V | baseline Δ | realistic Δ | realistic / baseline |
+|---:|---:|---:|---:|
+| 4 | 487.9 µs | 523.4 µs | 1.073× |
+| 8 | 541.6 µs | 542.7 µs | 1.002× |
+| 64 | 1.13 ms | 1.14 ms | 1.014× |
+| 512 | 5.90 ms | 5.83 ms | 0.989× |
+| 4096 (spec max) | 45.18 ms | 43.28 ms | 0.958× |
+
+![synthetic vs data-realistic state_transition fixture](./assets/bench-realism.svg)
+
+### 判定・観察
+
+- **realistic ≈ baseline(全 V で 0.96–1.07×)、一貫した方向なし**。realistic が速い V も遅い V もある。実行間ノイズ(同一セルで ±10–24%、特に V=512 は 4 プロセスで 0.89–1.10× に振れる)に対し、A/B 差は ±5–7% でその**ノイズ以下**。→ **散らばったビット＋高エントロピー root は STF pipeline の実測時間を有意に変えない**。
+- **なぜ効かないか**: pipeline は (1) 値非依存の SHA-256 `hash_tree_root`(大 V で支配、§1b の HTR 増分 +82%)と (2) ループ上限が `bits.size = V` の**無条件 O(A·V) ビット走査**が支配する。仮説していた分岐予測・比較短絡のコストは、これらに対して小さくノイズに埋もれる。
+- **含意**: §1/§1b の合成 fixture の数字は、fixture の規則性に対して**頑健**。データを現実寄りにしても headline は動かない(少なくとも測定ノイズの範囲で)。
+- **絶対値の注記**: 本節の絶対 Δ は §1b の canonical run(V=4096 で 27.55 ms)より高い(~45 ms)。これは baseline/realistic を interleave しつつ各セルで calibrate を回す持続負荷下の値で、熱・キャッシュ条件が §1b と異なるため。**本節の主眼は同一実行内の相対比**であり、絶対の正準値は §1b を参照。
+- **再現**: `cargo build --release --bin bench-state-transition-realism` 後に `rust-ffi/target/release/bench-state-transition-realism`。SVG は `python3 scripts/plot_realism.py`(埋め込みデータから再生成)。
+
 ## 2. `compute_lmd_ghost_head` (Aeneas direct, no fast path)
 
 軸: (B blocks, A attestations) ∈ `{100} × {32, 128}` × 5 試行 (default)。
@@ -184,6 +218,7 @@ cd rust-ffi && cargo build --release
 # 3. ベンチ実行 (per-cell isolation 推奨: cargo run はせず target/release を直接呼ぶ)
 target/release/bench-state-transition                      # V=4,8,64,512,4096, A=8 valid (~4 s)
 target/release/bench-state-transition --include-1m         # + V=1M (out-of-spec ref、1 trial ~4 s + ~584 MB rss、2 GiB stack)
+target/release/bench-state-transition-realism              # §1c data-realism A/B (synthetic vs scattered-bits + high-entropy roots)
 target/release/bench-ffi-marshal                           # V=1..4096 marshal (~数 s)
 target/release/bench-ffi-marshal --include-1m              # + V=1M (out-of-spec, ~57 MB payload)
 target/release/bench-fork-choice                           # B=100 × A=32,128 (~20 s、V 軸なし)

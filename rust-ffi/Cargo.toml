@@ -20,6 +20,10 @@ name = "bench-state-transition"
 path = "src/bin/bench-state-transition.rs"
 
 [[bin]]
+name = "bench-state-transition-realism"
+path = "src/bin/bench-state-transition-realism.rs"
+
+[[bin]]
 name = "bench-fork-choice"
 path = "src/bin/bench-fork-choice.rs"
 
