@@ -130,6 +130,10 @@ SHA-256 `hash_tree_root` 込みの STF pipeline。spec 上限 V=4096 で 26.40 m
 
 ![state_transition results (leanSpec range V ≤ 4096)](./assets/bench-htr-results-spec.svg)
 
+V–time は単純な線形ではなく、**V 非依存の固定費(床)+ V に線形な項**のアフィン関係 `t ≈ 0.30 ms + 6.3 µs·V`。下図はこれを分解し、固定費ベースライン(紫の水平線、~0.30 ms: 8 票分の `voteIsValid` 等)と線形項(橙、~6.3 µs·V: `O(A·V)` ホットループ + HTR merkleize)を明示した版。実測(青)は小 V で床に、大 V で線形項に漸近し、両者が交差する **V≈48** が平坦→線形の膝になる(V を 8× しても time 倍率が 2.07→5.41→6.86 と 8× に近づくのはこのため):
+
+![state_transition scaling: fixed baseline + linear-in-V (V ≤ 4096)](./assets/bench-htr-results-baseline.svg)
+
 <details><summary>参考: ZERO スタブとの比較図</summary>
 
 ![real hash_tree_root cost vs ZERO stub](./assets/htr-cost.svg)
