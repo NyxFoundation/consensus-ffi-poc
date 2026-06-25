@@ -1,6 +1,6 @@
 ---
 title: Rust ↔ Lean 4 FFI ベンチマーク実現可能性 調査メモ
-last_updated: 2026-05-05
+last_updated: 2026-06-25
 tags:
   - ffi
   - benchmark
@@ -521,7 +521,7 @@ Stage 1→2→3 のいずれかで失敗した場合、ベンチフェーズに�
 
 現プランは「各 bench iteration で genesis state から 1 block 分 state_transition を呼ぶ」。理想的には **state chain (genesis → block1 → state1 → block2 → state2 → …)** で、Rust 側が State の `lean_object*` を保持・連鎖させる運用。
 
-ユーザー決定: 理想形は将来の改善に回し、本タスクでは現プランで進める。[issue #6](https://github.com/NyxFoundation/consensus-lean4/issues/6) で追跡。
+ユーザー決定: 理想形は将来の改善に回し、本タスクでは現プランで進める。[issue #6](https://github.com/NyxFoundation/consensus-ffi-poc/issues/6) で追跡。
 
 必要な追加実装 (issue 化する範囲):
 - `csf_state_transition` の戻り値を UInt8 sentinel から `lean_object*` (新 State を指す) に変更するか、out-param で State を返す
@@ -700,13 +700,13 @@ Issue 10-11 を合わせて 11 個。M4 を a/b/c に分割しているので、
 
 - **A1 (確定)**: compute_lmd_ghost_head は B と A を振る。state_transition は N を振る。2 エントリポイントで軸が異なることを `docs/rust-ffi-benchmarks.md` に明記する。
 - **A2 (確定)**: PR #2 / #3 は参考として残し、本タスクは新規ブランチで独立実装する。
-- **A3 (確定、旧 Q3)**: `hash_tree_root_*` は stub (ZERO) のまま、レポートに "crypto cost excluded" を注記。実 SSZ Merkleization は [issue #5](https://github.com/NyxFoundation/consensus-lean4/issues/5) で future work として追跡、本タスクでは実施しない。
+- **A3 (確定、旧 Q3)**: `hash_tree_root_*` は stub (ZERO) のまま、レポートに "crypto cost excluded" を注記。実 SSZ Merkleization は [issue #5](https://github.com/NyxFoundation/consensus-ffi-poc/issues/5) で future work として追跡、本タスクでは実施しない。
 - **A4 (確定、旧 Q4)**: N スケール上限は、実測 N ≤ 100K (5 試行)、N=1M は 1 試行 (参考値)。ベンチ実行時間は ~10–15 分の見込み。
 - **A5 (確定、旧 Q5)**: PR #2 と `FunsExternal.lean` が編集衝突しうるが、両方 open のまま本ブランチで diff を最小化する方針 (選択肢 b)。axiom 置換は必要最小限に留める。
 - **A6 (確定)**: slow path (Aeneas 出力そのまま) のベンチは行わない。Option X で e2e のみ。形式検証の保証が Aeneas 出力には付随しないため、slow を残す動機がない。
 - **A7 (確定、旧 Q7)**: compute_lmd_ghost_head の B 上限は B ≤ 10K で打ち止め。B=32K (mainnet) は別途 `compute_lmd_ghost_head_fast` を書く必要があり、Future work。
 - **A8 (確定)**: 入力構築は Option II (Rust 側で State/Block/blocks/attestations を構築し `ToLean` で marshal → FFI)。marshal コストは timer 外に置き、ベンチ値は pipeline cost に絞る。
-- **A9 (確定)**: Option III (SSZ バイト列で FFI 境界を再設計) は future work。[issue #4](https://github.com/NyxFoundation/consensus-lean4/issues/4) で追跡、本タスクでは実施しない。
+- **A9 (確定)**: Option III (SSZ バイト列で FFI 境界を再設計) は future work。[issue #4](https://github.com/NyxFoundation/consensus-ffi-poc/issues/4) で追跡、本タスクでは実施しない。
 - **A10 (確定)**: 2 エントリポイントは別プロセスで独立計測 (`ru_maxrss` peak を分離するため)。`cargo run --release --bin bench-state-transition` と `cargo run --release --bin bench-fork-choice` に分割。
 - **A15 (確定、§7.1 (c))**: Bench ループは **Option A** — 毎 iter で同じ contents の state/block を新規 alloc して pipeline に渡す。`lean_inc` で template を使い回す Option B は FBIP の refcount>1 分岐で deep clone が timer 内に入るため採用しない。
 - **A16 (確定、§7.1 P7)**: `csf_state_transition` の戻り値は **UInt8 sentinel** (0=ok, 1=domain err, 2=panic, 3=div)。Lean が返す新 State は破棄する。State chain は P11 (future work issue) で扱う。
@@ -724,7 +724,7 @@ Issue 10-11 を合わせて 11 個。M4 を a/b/c に分割しているので、
 - **A23 (確定、§7.1 P19)**: Marshal.lean は**作らない**。Lean の proof irrelevance により `Vec α` の `property` フィールドは runtime に `lean_box(0)` に erase されるため、Rust が Vec の ctor layout (tag 0, 2 obj fields) を直接組んで OK。`wrap_list_as_vec(list: *mut lean_object) -> *mut lean_object` を Rust 側 1 関数だけ実装、element type 非依存。
 - **A24 (確定、§7.1 P20)**: Rust 側に `lean_list_nil()` / `lean_list_cons(head, tail)` / `list_from_iter(items, to_lean)` を `rust-ffi/src/to_lean.rs` に実装。iter.rev() + cons で正順 List を構築、N 要素で N 回 `lean_alloc_ctor`。
 - **A25 (確定、§7.1 P23)**: `lean_object*` の所有権は **owned / single-use** convention。Rust が FFI に渡したら即座に pointer を無効扱い、再利用禁止。Option A では Lean が consume して戻り値は UInt8 なので、Rust 側に `lean_inc_ref` / `lean_dec_ref` は**一切不要**。`@[export]` は PR #2 と同じく `@&` アノテーションなし (default owned) で書く。
-- **A26 (確定、§7.1 P5)**: モジュール初期化は **top-level エントリモジュール 1 本だけ**呼ぶ。`initialize_consensus_x2dlean4_ConsensusLean4_Ffi(1, null)` → 依存モジュール (Funs umbrella + Funs/{Types, JustifiedSlots, ForkChoice, StateTransition} / FunsExternal / FastPath / Types) は Lean runtime が transitive に初期化してくれる。PR #2 の実績パターン踏襲。検証は M1 smoke で実機確認。
+- **A26 (確定、§7.1 P5)**: モジュール初期化は **top-level エントリモジュール 1 本だけ**呼ぶ。`initialize_consensus_x2dffi_x2dpoc_ConsensusLean4_Ffi(1, null)` → 依存モジュール (Funs umbrella + Funs/{Types, JustifiedSlots, ForkChoice, StateTransition} / FunsExternal / FastPath / Types) は Lean runtime が transitive に初期化してくれる。PR #2 の実績パターン踏襲。検証は M1 smoke で実機確認。
 - **A27 (確定、§7.1 P8)**: `csf_*_noop` twin は「入力を受けて pipeline を走らせず即 return」。具体的には `UInt8` sentinel を `0` で即返す。Lean の `@[export]` convention で入力 `lean_object*` は consume される (Lean runtime が dec_ref)。paired-delta が測るのは:
   - 主 wrapper: FFI 境界 + Lean 側 consume (dec_ref) + pipeline 本体
   - noop twin: FFI 境界 + Lean 側 consume (dec_ref) のみ
@@ -898,7 +898,7 @@ extern "C" {
 - デフォルトで hidden visibility
 - `.c.o.noexport` に出る
 
-**ルール**: **FFI 境界に露出する関数は必ず `@[export <安定な名前>]` を付ける**。`csf_` プレフィックスは consensus-lean4 FFI symbols 用の慣例 (PR #2 で採用済)。
+**ルール**: **FFI 境界に露出する関数は必ず `@[export <安定な名前>]` を付ける**。`csf_` プレフィックスは consensus-ffi-poc FFI symbols 用の慣例 (PR #2 で採用済)。
 
 ### 11.6 ランタイム初期化は 4 段階
 
@@ -908,14 +908,14 @@ Rust main から Lean 関数を呼ぶ前に、以下を**この順序で exactly
 extern "C" {
     fn lean_initialize_runtime_module();
     fn lean_initialize();
-    fn initialize_consensus_x2dlean4_ConsensusLean4_Ffi(builtin: u8, w: *mut c_void) -> *mut c_void;
+    fn initialize_consensus_x2dffi_x2dpoc_ConsensusLean4_Ffi(builtin: u8, w: *mut c_void) -> *mut c_void;
     fn lean_io_mark_end_initialization();
 }
 
 unsafe {
     lean_initialize_runtime_module();                                   // (1) runtime core を起動
     lean_initialize();                                                  // (2) IO monad の世界を初期化
-    initialize_consensus_x2dlean4_ConsensusLean4_Ffi(1, std::ptr::null_mut());  // (3) 各モジュールの top-level 初期化
+    initialize_consensus_x2dffi_x2dpoc_ConsensusLean4_Ffi(1, std::ptr::null_mut());  // (3) 各モジュールの top-level 初期化
     lean_io_mark_end_initialization();                                  // (4) 初期化フェーズ終了を runtime に通知
 }
 // この後に @[export] 関数を呼んで OK
@@ -924,7 +924,7 @@ unsafe {
 - **(1)** runtime 側のシングルトン状態 (allocator, thread-local 等) を構築
 - **(2)** IO action を走らせる基盤 (world トークン) を用意
 - **(3)** 各 Lean モジュールの `def` の side effect を実行し、constant を alloc。`initialize_<escaped_package>_<module_path>` が関数名。dash (`-`) は `_x2d` に escape される
-    - 例: パッケージ `consensus-lean4`、モジュール `ConsensusLean4.Ffi` → `initialize_consensus_x2dlean4_ConsensusLean4_Ffi`
+    - 例: パッケージ `consensus-ffi-poc`、モジュール `ConsensusLean4.Ffi` → `initialize_consensus_x2dffi_x2dpoc_ConsensusLean4_Ffi`
     - 依存モジュール (`ConsensusLean4.Funs`, `ConsensusLean4.FastPath` 等) の初期化は Lean runtime が transitive に呼んでくれるので、**エントリモジュール分だけ呼べばよい**
 - **(4)** 「初期化完了」を runtime に伝える。これを呼ばずに通常の Lean 関数を呼ぶと、あるケースで IO state が inconsistent になる (PR #2 実装はこれを入れている)
 
@@ -962,8 +962,8 @@ Rust binary が最終的に必要とするもの:
 
 完了済 (2026-04-24):
 - ✓ `docs/ffi-feasibility.md` 作成 + push (commit `cbeb548`)
-- ✓ [issue #4](https://github.com/NyxFoundation/consensus-lean4/issues/4) 発行 (Option III: SSZ バイト列 FFI)
-- ✓ [issue #5](https://github.com/NyxFoundation/consensus-lean4/issues/5) 発行 (`hash_tree_root_*` real 実装)
+- ✓ [issue #4](https://github.com/NyxFoundation/consensus-ffi-poc/issues/4) 発行 (Option III: SSZ バイト列 FFI)
+- ✓ [issue #5](https://github.com/NyxFoundation/consensus-ffi-poc/issues/5) 発行 (`hash_tree_root_*` real 実装)
 - ✓ Q3, Q4, Q5, Q7 を A3, A4, A5, A7 として解消 (§8)
 - ✓ §11「付録: ファイル形式と変換の流れ」docs 同期
 - ✓ §6.1 「C5 詳細: 署名検証と Rust 連携」docs 同期
@@ -979,7 +979,7 @@ Rust binary が最終的に必要とするもの:
 
 残り (承認後):
 1. ✓ §7.1 / §7.2 を `docs/ffi-feasibility.md` に同期 (2026-04-24 完了)
-2. ✓ [issue #6](https://github.com/NyxFoundation/consensus-lean4/issues/6) 作成 (P11: realistic block-building benchmark, state chaining across blocks)
+2. ✓ [issue #6](https://github.com/NyxFoundation/consensus-ffi-poc/issues/6) 作成 (P11: realistic block-building benchmark, state chaining across blocks)
 3. ✓ Epic + サブ issue を GitHub に作成 (issue #7-#16)
 4. 実装は Epic の sub-issue 毎に進める (M0 → M1 → M2 → … の順)
 5. lean-toolchain 変更が必要になった場合は**単独で**再確認 (包括承認下でも別扱い)

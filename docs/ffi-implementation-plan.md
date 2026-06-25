@@ -1,6 +1,6 @@
 ---
 title: Rust ↔ Lean 4 FFI ベンチマーク 実装計画
-last_updated: 2026-05-05
+last_updated: 2026-06-25
 tags:
   - ffi
   - implementation
@@ -110,7 +110,7 @@ tags:
   - 冒頭で `Command::new("lake").arg("build").current_dir("..")` を invoke (A22)
   - `rerun-if-changed` 対象: `build.rs` / `../ConsensusLean4/` (dir 全体、新サブディレクトリ `Funs/` も自動カバー) / `../lakefile.lean` / `../lean-toolchain` / `../lake-manifest.json` (A21)
 - `rust-ffi/src/main.rs` (新規、~40 行):
-  - extern block: `csf_ping`, `lean_initialize_runtime_module`, `lean_initialize`, `initialize_consensus_x2dlean4_ConsensusLean4_Ffi`, `lean_io_mark_end_initialization`
+  - extern block: `csf_ping`, `lean_initialize_runtime_module`, `lean_initialize`, `initialize_consensus_x2dffi_x2dpoc_ConsensusLean4_Ffi`, `lean_io_mark_end_initialization`
   - 初期化 4 段階 (A26)
   - `assert_eq!(csf_ping(41), 42)`
 
@@ -247,7 +247,7 @@ def csfComputeLmdGhostHeadNoop
     (_min_score : Aeneas.Std.U64) : UInt8 := 0
 ```
 
-- 初期化関数シンボル名 (`initialize_consensus_x2dlean4_ConsensusLean4_Ffi`) を `nm` で確認、Rust 側 extern 宣言と一致
+- 初期化関数シンボル名 (`initialize_consensus_x2dffi_x2dpoc_ConsensusLean4_Ffi`) を `nm` で確認、Rust 側 extern 宣言と一致
 - `compute_lmd_ghost_head` は `Funs/ForkChoice.lean:991` から transitive import 経由で取得
 - `state_transition.*` は `Funs/StateTransition.lean` から、umbrella `Funs.lean` 経由
 
@@ -364,12 +364,12 @@ PR #17 (Funs.lean → Funs/{Types,JustifiedSlots,ForkChoice,StateTransition}.lea
 - **A23**: Marshal.lean は作らない。Rust が Vec の ctor layout を直接組む (proof irrelevance により property = lean_box(0))
 - **A24**: Rust 側 `lean_list_nil` / `lean_list_cons` / `list_from_iter` で List 構築
 - **A25**: FFI 境界の所有権規約は owned / single-use、`lean_inc`/`lean_dec` は Rust 側で呼ばない
-- **A26**: モジュール初期化は top-level (`initialize_consensus_x2dlean4_ConsensusLean4_Ffi`) 1 本のみ、transitive は Lean runtime に任せる
+- **A26**: モジュール初期化は top-level (`initialize_consensus_x2dffi_x2dpoc_ConsensusLean4_Ffi`) 1 本のみ、transitive は Lean runtime に任せる
 - **A27**: `*_noop` twin は入力を consume して UInt8=0 で即 return、paired-delta で pipeline 純粋時間を抽出
 - **A28**: PR #2 パターンを踏襲する informational 項目 — Result 2 重マッチ / `@[inline]` / 11 IR ディレクトリ走査
 
 ## future work (本タスク外、issue で追跡)
 
-- [issue #4](https://github.com/NyxFoundation/consensus-lean4/issues/4): Option III (SSZ バイト列 FFI) 移行
-- [issue #5](https://github.com/NyxFoundation/consensus-lean4/issues/5): `hash_tree_root_*` real 実装
-- [issue #6](https://github.com/NyxFoundation/consensus-lean4/issues/6): realistic block-chaining benchmark (state chaining)
+- [issue #4](https://github.com/NyxFoundation/consensus-ffi-poc/issues/4): Option III (SSZ バイト列 FFI) 移行
+- [issue #5](https://github.com/NyxFoundation/consensus-ffi-poc/issues/5): `hash_tree_root_*` real 実装
+- [issue #6](https://github.com/NyxFoundation/consensus-ffi-poc/issues/6): realistic block-chaining benchmark (state chaining)

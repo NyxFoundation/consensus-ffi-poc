@@ -1,4 +1,4 @@
-# consensus-lean4
+# consensus-ffi-poc
 
 Lean 4 formalization of the [Lean Consensus](https://github.com/leanEthereum/leanSpec) (3SF-mini) protocol, automatically generated from a Rust implementation using [Aeneas](https://github.com/AeneasVerif/aeneas).
 
