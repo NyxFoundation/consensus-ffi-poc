@@ -89,8 +89,16 @@ attestations so the `O(A·V)` fast path actually runs, and asserts a fixture sel
 (`att_cells == 9`) before timing. Reference budgets and judgment criteria live in
 [`docs/timing-budget.md`](docs/timing-budget.md); the spec-constant axis rationale and
 detailed result tables are in [`docs/rust-ffi-benchmarks.md`](docs/rust-ffi-benchmarks.md)
-(§0 pins the leanSpec / mainnet constants). Crypto cost (`hash_tree_root_*`) is excluded —
-those return `H256.ZERO` per the spec stubs in `ConsensusLean4/Funs/Types.lean`.
+(§0 pins the leanSpec / mainnet constants). `hash_tree_root` is computed for real
+(SSZ merkleization in `ConsensusLean4/Merkleization.lean` over a Rust `@[extern]`
+SHA-256), so the state-root and parent-root checks are live; see §1b for the
+HTR-included numbers. Signature verification (XMSS) is still outside the STF and
+not measured.
+
+> **Regen note**: the real HTR is wired in by hand-swapping the three
+> `hash_tree_root_*` stubs in the **Aeneas-generated** `ConsensusLean4/Funs/Types.lean`
+> from `ok H256.ZERO` to `ConsensusLean4.Merkle.*` calls. Re-running Aeneas reverts
+> them to the ZERO stub — redo the swap (3 functions) after any regen.
 
 ## Source
 
