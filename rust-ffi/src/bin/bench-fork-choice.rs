@@ -20,6 +20,11 @@ use std::ffi::c_void;
 use std::ptr;
 use std::time::{Duration, Instant};
 
+// Provides `csf_sha256_raw` for the `csf_sha256` shim that ConsensusLean4
+// references via `@[extern]`; every binary linking the Lean lib needs it.
+#[path = "../sha_extern.rs"]
+mod sha_extern;
+
 #[link(name = "Init_shared")]
 extern "C" {
     fn lean_initialize_runtime_module();

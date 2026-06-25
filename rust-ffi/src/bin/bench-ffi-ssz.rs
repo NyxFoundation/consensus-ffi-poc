@@ -27,6 +27,11 @@ use std::hint::black_box;
 use std::ptr;
 use std::time::{Duration, Instant};
 
+// Provides `csf_sha256_raw` for the `csf_sha256` shim that ConsensusLean4
+// references via `@[extern]`; every binary linking the Lean lib needs it.
+#[path = "../sha_extern.rs"]
+mod sha_extern;
+
 #[link(name = "Init_shared")]
 extern "C" {
     fn lean_initialize_runtime_module();
@@ -150,9 +155,20 @@ struct Row {
 fn bench_cell(n: u64) -> Row {
     let buf = serialize_fixture(n);
 
-    // Correctness gate: the decoded fixture must transition cleanly (Ok = 0).
+    // Codec gate: the decoded fixture must reach a deterministic sentinel.
+    // Since hash_tree_root is now live (real SHA-256), this synthetic flat fixture
+    // carries ZERO parent_root/state_root, so the STF bails at the parent-root
+    // check with InvalidParent (sentinel 1) rather than Ok. That is expected and
+    // fine here: this bench's subject is the marshal/decode byte-boundary split,
+    // not STF completion — the STF column reflects decode + the process_slots
+    // hash_tree_root(state) up to the parent-root check. A 2 (Aeneas fail) or 3
+    // (div) would indicate a real codec break.
     let sentinel = unsafe { csf_bench_state_transition_ssz_run(csf_make_bytearray(buf.as_ptr(), buf.len())) };
-    assert_eq!(sentinel, 0, "N={n}: ssz_run sentinel must be 0 (Ok), got {sentinel} — codec mismatch");
+    assert!(
+        sentinel == 0 || sentinel == 1,
+        "N={n}: ssz_run sentinel must be 0 (Ok) or 1 (InvalidParent, expected under live HTR), \
+         got {sentinel} — codec break"
+    );
 
     let marshal = bench(&buf, csf_bench_marshal_noop);
     let decode_total = bench(&buf, csf_bench_state_transition_ssz_decode);
@@ -178,7 +194,9 @@ fn main() {
 
     println!("# End-to-end SSZ-bytes pipeline: marshal → decode → pure STF");
     println!();
-    println!("Fixture = §1 buildBenchState(n)/buildBenchBlock(n), serialized. Codec gate: sentinel 0 (Ok).");
+    println!("Fixture = empty-block buildBenchState(n)/buildBenchBlock(n), serialized (flat codec, not canonical SSZ).");
+    println!("hash_tree_root is now live (SHA-256): the ZERO-root flat fixture bails at the parent-root check");
+    println!("(sentinel 1, InvalidParent), so STF = decode + process_slots htr(state). marshal/decode are the subject.");
     println!();
     println!("| N | payload | marshal | decode | STF | total (e2e) |");
     println!("|---:|---:|---:|---:|---:|---:|");
@@ -200,7 +218,7 @@ fn main() {
     println!();
     println!(
         "> marshal = alloc+memcpy+dec_ref; decode = ssz_decode−marshal (bytes→typed State/Block); \
-         STF = ssz_run−ssz_decode (pure stateTransitionFast). Trials={TRIALS}. \
-         Flat codec, no canonical SSZ / hash_tree_root."
+         STF = ssz_run−ssz_decode (stateTransitionFast; bails at parent-root htr for this flat fixture). \
+         Trials={TRIALS}. Flat codec (not canonical SSZ); hash_tree_root itself is real SHA-256."
     );
 }

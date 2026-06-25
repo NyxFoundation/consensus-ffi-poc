@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+sha2 = "0.10"
 
 [build-dependencies]
 cc = "1"

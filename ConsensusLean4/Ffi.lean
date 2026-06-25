@@ -23,6 +23,8 @@
 import ConsensusLean4.FastPath
 import ConsensusLean4.Funs
 import ConsensusLean4.Types
+import ConsensusLean4.Sha
+import ConsensusLean4.Merkleization
 open Aeneas Aeneas.Std ethlambda_verification
 
 set_option maxHeartbeats 1000000
@@ -46,6 +48,24 @@ def csfPing (n : UInt64) : UInt64 := n + 1
   | .ok  _   => 0
   | .fail _  => 2
   | .div     => 3
+
+/-- Fill `blk0`'s `parent_root` / `state_root` so the real (no longer stubbed)
+`hash_tree_root` checks in `process_block_header` and the final state-root
+comparison both pass. No circularity: the post-state never reads
+`block.state_root`, so we (1) set `parent_root = htr(header process_slots
+advances to)`, (2) run the pipeline once to obtain the post-state, (3) set
+`state_root = htr(post-state)`. Used by every fixture whose block must be
+accepted now that `hash_tree_root` is live (SHA-256, ConsensusLean4.Merkle). -/
+private def mkConsistentBlock (state : types.State) (blk0 : types.Block) : types.Block :=
+  let advancedHeader : types.BlockHeader :=
+    { state.latest_block_header with
+        state_root := ConsensusLean4.Merkle.hashTreeRootState state }
+  let parentRoot := ConsensusLean4.Merkle.hashTreeRootBlockHeader advancedHeader
+  let blk1 := { blk0 with parent_root := parentRoot, state_root := types.H256.ZERO }
+  match ConsensusLean4.FastPath.stateTransitionFast state blk1 with
+  | .ok (_, s2) => { blk1 with state_root := ConsensusLean4.Merkle.hashTreeRootState s2 }
+  | .fail _     => blk1  -- unreachable for these fixtures
+  | .div        => blk1
 
 /-- Run the handwritten Array-backed pipeline and pack the result. -/
 @[export csf_state_transition]
@@ -129,11 +149,13 @@ private def smokeBlockBadSlot : types.Block :=
 -- `extern static` on the Rust side); a function with one scalar arg gets
 -- a proper TEXT symbol that Rust can `extern fn` against.
 
-/-- Smoke entry: 2-validator genesis, advance one slot, no attestations. -/
+/-- Smoke entry: 2-validator genesis, advance one slot, no attestations. The block
+gets consistent SSZ roots (real hash_tree_root is live) so it is accepted. -/
 @[export csf_smoke_state_transition_ok]
 def csfSmokeStateTransitionOk (_seed : UInt64) : UInt8 :=
   packStatePipeline
-    (ConsensusLean4.FastPath.stateTransitionFast smokeGenesisState smokeBlockAtSlot1)
+    (ConsensusLean4.FastPath.stateTransitionFast smokeGenesisState
+      (mkConsistentBlock smokeGenesisState smokeBlockAtSlot1))
 
 /-- Smoke entry: same state, broken block.slot → domain error sentinel 1. -/
 @[export csf_smoke_state_transition_err]
@@ -380,6 +402,8 @@ private def buildBenchStateAtt (n : UInt64) : types.State :=
 
 private def buildBenchBlockAtt (n : UInt64) : types.Block :=
   -- Proposer for slot 13 = 13 % V (current_proposer = slot % num_validators).
+  -- parent_root / state_root are placeholders; mkConsistentBlock fills the real
+  -- SSZ roots so the now-live hash_tree_root checks pass.
   let proposerRaw : UInt64 := if n = 0 then 0 else 13 % n
   { slot := 13#u64
     proposer_index := u64OfUInt64 proposerRaw
@@ -387,29 +411,34 @@ private def buildBenchBlockAtt (n : UInt64) : types.Block :=
     state_root := types.H256.ZERO
     body := { attestations := buildAttAttestations n.toNat } }
 
-/-- Build the V-validator genesis + 8-valid-vote block and run the fast pipeline.
-The `_a` slot is the fixed spec attestation count (8); it is ignored here because
-the count is baked into `attTargetSlots`, but kept in the signature so the Rust
-harness plumbing stays uniform with the other bench entry points. -/
+/-- Build the V-validator genesis + 8-valid-vote block (with consistent SSZ roots)
+and run the fast pipeline — now including real `hash_tree_root` (SHA-256). The
+`_a` slot is the fixed spec attestation count (8), baked into `attTargetSlots`;
+kept in the signature so the Rust harness plumbing stays uniform. -/
 @[export csf_bench_state_transition_att_run]
 def csfBenchStateTransitionAttRun (n _a _seed : UInt64) : UInt8 :=
-  packStatePipeline
-    (ConsensusLean4.FastPath.stateTransitionFast
-      (buildBenchStateAtt n) (buildBenchBlockAtt n))
+  let state := buildBenchStateAtt n
+  let block := mkConsistentBlock state (buildBenchBlockAtt n)  -- prep (cancels in Δ)
+  packStatePipeline (ConsensusLean4.FastPath.stateTransitionFast state block)
 
-/-- Paired-delta twin: build the same State + Block, skip the pipeline. -/
+/-- Paired-delta twin: run the identical prep (state build + mkConsistentBlock,
+which itself runs one pipeline) but skip the *measured* pipeline. Δ = run −
+buildonly isolates exactly one real-HTR state transition. -/
 @[export csf_bench_state_transition_att_buildonly]
 def csfBenchStateTransitionAttBuildOnly (n _a _seed : UInt64) : UInt8 :=
-  consumeState (buildBenchStateAtt n) ^^^ consumeBlock (buildBenchBlockAtt n)
+  let state := buildBenchStateAtt n
+  let block := mkConsistentBlock state (buildBenchBlockAtt n)
+  consumeState state ^^^ consumeBlock block
 
 /-- Verification probe: `justifications_roots` length after the pipeline. With all
 8 votes processed (none skipped, no 2/3 bail) the serialiser prepends a ZERO
 sentinel root ⇒ length 9. The Rust harness asserts this before timing so a broken
-fixture (silently-skipped votes) can never be measured as a fast result. -/
+fixture (skipped votes, or a root-mismatch early-out) can't be measured as fast. -/
 @[export csf_bench_state_transition_att_cells]
 def csfBenchStateTransitionAttCells (n : UInt64) : UInt8 :=
-  match ConsensusLean4.FastPath.stateTransitionFast
-      (buildBenchStateAtt n) (buildBenchBlockAtt n) with
+  let state := buildBenchStateAtt n
+  let block := mkConsistentBlock state (buildBenchBlockAtt n)
+  match ConsensusLean4.FastPath.stateTransitionFast state block with
   | .ok (_, s) => (min s.justifications_roots.val.length 255).toUInt8
   | _          => 0
 

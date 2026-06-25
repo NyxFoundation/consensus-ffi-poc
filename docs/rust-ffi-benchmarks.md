@@ -1,6 +1,6 @@
 ---
 title: Rust ↔ Lean 4 FFI ベンチマーク 実測結果
-last_updated: 2026-06-25
+last_updated: 2026-06-26
 tags:
   - benchmark
   - ffi
@@ -34,7 +34,7 @@ tags:
 
 ## 重要な前提と限界
 
-1. **暗号コストは除外** (A3): `hash_tree_root_*` は ZERO スタブ (`Funs/Types.lean:138-156`)。本物の SSZ ハッシュ計算は加算されない。
+1. **`hash_tree_root` は実 SHA-256 で計算される** (issue #5, §1b): 旧 ZERO スタブを廃し、`ConsensusLean4.Merkle`(純 Lean SSZ merkleize)＋ Rust `@[extern]` の SHA-256(sha2 crate)で本物の root を計算する。step4 の state_root 照合と `process_block_header` の parent_root 照合は live。**ただし署名検証(XMSS)は依然 STF 外で未計測**(§4e)。
 2. **Bench fixture は spec 標準ワークロード**:
    - `state_transition`: V validators の State + **A = `MAX_ATTESTATIONS_DATA` = 8 個の有効 AggregatedAttestation** を載せた Block。`processAttestationsFast` の `O(A·V)` ホットループが実際に走る (§1)。8 票はすべて `voteIsValid` を通り、かつ 2/3 finalize 閾値未満を維持 (fast path 継続)。**旧版は A=0 の空ブロックで構築コストのみを測っていた**ため、本再測で STF 本体に置き換えた。
    - `compute_lmd_ghost_head`: 線形チェーン B blocks + A attestations が最終 block にすべて投票。`alloc.vec.Vec` が `List`-backed のため、内部の block index は `List.indexOf` ベースで O(B)。**V 軸を持たない** (B blocks / A attestations でスケール、B ≤ `HISTORICAL_ROOTS_LIMIT = 2^18`) ため V 上限の修正対象外で、本再測では §2 の旧値を据え置く。
@@ -97,6 +97,37 @@ fixture は `is_valid_vote` / `slot_is_justifiable_after` / `current_proposer` (
 ![state_transition scaling: leanSpec V ≤ 4096 vs mainnet 1M](./assets/bench-scaling.svg)
 
 log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spec (V > 4096)。spec 上限 V=4096 でも STF pipeline は 15 ms で SLO target 200 ms の下、marshal は更に 3 桁下。V=1M は両 budget を突破 (4.17 s) し、leanSpec モデルでは到達不能。データは本節 §1 / §4c の実測値 (2026-06-25, AMD Ryzen 9 PRO 8945HS)。
+
+> **注**: 上表・上図は `hash_tree_root` を ZERO スタブにした値。**実 SHA-256 HTR を有効にした再測は §1b**。
+
+## 1b. `state_transition` — 実 `hash_tree_root` (SHA-256) 込み (issue #5)
+
+§1 の値は HTR を ZERO スタブにしていた(照合が vacuous)。本節は **実 SSZ `hash_tree_root` を STF に組み込んだ**再測。実装:
+
+- **`ConsensusLean4.Merkle`**(純 Lean): leanSpec `spec/crypto/merkleization.py` 準拠の SSZ merkleize(32B chunk → `next_pow2` zero-padding → 二分木 → `mix_in_length`)。State/Block 全型の `hash_tree_root`。
+- **SHA-256**: Rust `@[extern "csf_sha256"]`(sha2 crate)を C shim 経由で呼ぶ。leanSpec の HTR は **SHA-256**(SHA-2、`merkleization.py` の `from hashlib import sha256`)であり Poseidon ではない。Poseidon2/KoalaBear は XMSS 署名専用。
+- **検証**: `csf_selftest_htr` が uint64 LE 詰め・2-leaf merkleize・正準 SSZ `zerohashes[1] = sha256(64 zeros) = f5a5fd42…fb4b` に一致(published vector)。
+- **fixture root-consistent 化**: HTR が live になると `parent_root`/`state_root` 照合が本物になるため、`mkConsistentBlock` で `parent_root = htr(advanced header)`・`state_root = htr(post-state)` を逆算(循環なし: post-state は `block.state_root` を読まない)。paired-delta は prep-cancellation(run と buildonly が同じ prep を踏み、Δ が実 HTR 込み STF を 1 回だけ抽出)。
+
+### 計測結果 (V = 4 … 4096、A=8 valid attestations、5 trials)
+
+| V | run median | buildonly | **pipeline (Δ, 実 HTR 込み)** | §1 stub Δ | HTR 増分 | sentinel |
+|---:|---:|---:|---:|---:|---:|:---:|
+| 4 | 707.3 µs | 391.8 µs | **315.5 µs** | 316.9 µs | ~0 | 0 |
+| 8 | 815.0 µs | 445.4 µs | **369.6 µs** | 330.5 µs | +12% | 0 |
+| 64 | 1.83 ms | 1.06 ms | **761.9 µs** | 536.2 µs | +42% | 0 |
+| 512 | 10.91 ms | 7.36 ms | **3.55 ms** | 2.15 ms | +65% | 0 |
+| 4096 (spec max) | 75.68 ms | 48.14 ms | **27.55 ms** | 15.12 ms | **+82%** | 0 |
+
+![real hash_tree_root cost vs ZERO stub](./assets/htr-cost.svg)
+
+### 判定・観察
+
+- **spec 上限 V=4096 でも 27.55 ms で 🟢 green**(SLO target 200 ms の 1/7)。実 HTR を入れても 1 スロット ~4 s の世界では余裕。
+- **HTR 増分は V とともに拡大**(+0% → +82%)。小 V は 8 票分の `voteIsValid` 固定費が支配で HTR の相対比が小さく、大 V では post-state の merkleize(O(V) validators + O(R·V) justification bits を SHA-256 で畳む)が効いて ~+12 ms。HTR コストは V に概ね線形。
+- **paired-delta の整合**: V=4096 で run 75.68 = build 16 + 2×STF(27.55)、buildonly 48.14 = build + 1×STF。Δ = 実 HTR 込み STF を 1 回分、正しく抽出。
+- **att_cells = 9 を維持**: 実 HTR 化後も 8 票はすべて有効処理(root 整合化は投票の有効性に影響しない)。
+- **依然 STF 外**: 署名検証(XMSS/Poseidon)は未計測(§4e ①)。本節は「実 HTR 込み・署名検証なし」の値。
 
 ## 2. `compute_lmd_ghost_head` (Aeneas direct, no fast path)
 
@@ -335,34 +366,36 @@ def state_transition(state, block, valid_signatures=True):
 |---|---|---|
 | 2. `process_slots` (L135) | `state_transition.process_slots` | ✅ 実装 |
 | 3. `process_block` (L332) | `processBlockFast` | ✅ 実装 |
-| ├ `process_block_header` (L195) | `state_transition.process_block_header` | ✅(内部 HTR は stub) |
-| └ `process_attestations` (L385) | `processAttestationsFast` + `try_finalize` | ✅ 実装 |
-| 4. `hash_tree_root` 照合 (L644) | `hash_tree_root_state`→`eq`→`StateRootMismatch` | ⚠️ 枠のみ。HTR は `ok H256.ZERO` stub |
+| ├ `process_block_header` (L195) | `state_transition.process_block_header` | ✅(内部 HTR も実 SHA-256、§1b) |
+| └ `process_attestations` (L385) | `processAttestationsFast` + `try_finalize` | ✅ 実装(§1 で A=8 有効投票を駆動) |
+| 4. `hash_tree_root` 照合 (L644) | `hash_tree_root_state`→`eq`→`StateRootMismatch` | ✅ 実装。HTR は実 SSZ SHA-256(§1b) |
 | 1. `valid_signatures` 前提 (L634) | — | ❌ 引数なし(常に valid 扱い) |
 | `verify_signatures` (L864, 別メソッド) | — | ❌ 完全欠如 |
 
-→ **`state_transition` 本体の step 2・3 は完全、step 4 は構造のみ実装済み。** 欠けているのは関数外の署名検証と、step 4 の実ハッシュ。
+→ **`state_transition` 本体の step 2・3・4 は実装済み**(step4 の HTR は実 SHA-256、§1b)。欠けているのは**関数外の署名検証のみ**。
+
+> **訂正 (issue #5)**: 本節の旧版は「leanSpec の HTR は Poseidon1/KoalaBear(SHA-256 ではない)」と記していたが**誤り**。leanSpec の `hash_tree_root`(`spec/crypto/merkleization.py`)は **SHA-256**(`from hashlib import sha256`)。Poseidon2/KoalaBear は **XMSS 署名**(`spec/crypto/xmss/`)専用で、state root の merkleize には使われない。したがって実 HTR は SHA-256 で実装可能・実装済み(§1b)で、コストも Poseidon ほど大きくない(V=4096 で +12 ms)。
 
 ### realistic STF への差分(実装先つき)
 
-| # | 欠けている処理 | 実装先 | 備考 |
+| # | 欠けている処理 | 実装先 | 状態 |
 |---|---|---|---|
-| ① | `verify_signatures` (L864): 提案者 + 集約署名 (XMSS) | **Rust/FFI**(leanSig/leanMultisig, Plonky3) + 段取りは Lean | leanSpec では STF の外。最大コスト |
-| ② | 実 `hash_tree_root` (step 4 / header 内) | merkleize 構造=**Lean**、**Poseidon1** 置換=Rust/FFI or Lean | leanSpec は **Poseidon1/KoalaBear**(SHA-256 ではない) |
-| ③ | 非空 attestation/justification 入力 | データ(leanSpec テストベクタ) | 現 fixture は空で 3SF 本体が未駆動 |
-| ④ | 正準 SSZ codec | **Lean**(decode) | 現状はフラット自前コーデック |
-| ⑤ | マルチスロット/エポック境界 | **Lean**(既存ロジック) | 入力次第で駆動 |
+| ① | `verify_signatures` (L864): 提案者 + 集約署名 (XMSS) | **Rust/FFI**(leanSig/leanMultisig, Plonky3) + 段取りは Lean | ❌ 未実装。leanSpec では STF の外。**最大コスト**(Poseidon/XMSS) |
+| ② | 実 `hash_tree_root` (step 4 / header 内) | merkleize 構造=**Lean**(`ConsensusLean4.Merkle`)、SHA-256=**Rust `@[extern]`** | ✅ **実装済み(§1b、issue #5)** |
+| ③ | 非空 attestation/justification 入力 | データ | ✅ §1 で A=`MAX_ATTESTATIONS_DATA`=8 有効投票を駆動。**2/3 finalization 遷移は未駆動**(票を 2/3 未満に抑制) |
+| ④ | 正準 SSZ codec | **Lean**(decode) | ⚠️ 現状はフラット自前コーデック(§4d) |
+| ⑤ | マルチスロット/エポック境界 | **Lean**(既存ロジック) | ⚠️ 入力次第で駆動(現 fixture は 1 スロット前進) |
 
-**信頼境界の原則**: 検証対象ロジック (STF / SSZ decode / merkleize 構造 / 署名検証の段取り) は Lean、重い暗号プリミティブ (Poseidon1 置換, XMSS/集約 ZK 検証) は Rust/FFI。`compute_block_weights` (L1370) は STF ではなく fork-choice(§2 `compute_lmd_ghost_head`)で別系統。
+**信頼境界の原則**: 検証対象ロジック (STF / SSZ decode / merkleize 構造 / 署名検証の段取り) は Lean、重い暗号プリミティブ (SHA-256 / XMSS・集約 ZK 検証) は Rust/FFI。§1b の実 HTR がこの境界の最初の実例(merkleize=Lean、SHA-256=Rust `@[extern]`)。`compute_block_weights` (L1370) は STF ではなく fork-choice(§2)で別系統。
 
-**ベンチ解釈への含意**: §1/§4 の数値は「署名検証なし・HTR=ZERO・attestation 空」での値。realistic STF では ① 署名検証(支配項)+ ② Poseidon HTR が加わり、桁が上がる。現数値は **FFI/decode/STF ロジックの下限**として読むこと。
+**ベンチ解釈への含意**: §1b の数値は「実 HTR(SHA-256)込み・**署名検証なし**・A=8・2/3 finalization 未駆動」での値。realistic STF への残差は主に ① 署名検証(支配項)。現数値は **署名検証を除く STF の実コスト**として読むこと。
 
 ## 5. Future work
 
 `docs/ffi-feasibility.md` に既出の項目を実数値で裏付け:
 
 - **issue #4** (Option III SSZ): bench fixture を SSZ バイト列マーシャルに切り替え、ToLean 構築コストを排除
-- **issue #5** (`hash_tree_root` real 実装): "crypto cost excluded" 注記が外れた状態で再測
+- ~~**issue #5** (`hash_tree_root` real 実装)~~: **完了(§1b)**。実 SSZ SHA-256 HTR を STF に組み込み再測。V=4096 で 27.55 ms。残課題は署名検証(①)
 - **issue #6** (block-chaining bench): 現 fixture は genesis→1 block のみ。N block chain で連続 state を計測
 - **新規候補** (本実測から): `compute_lmd_ghost_head_fast` (Array-backed) の handwritten 実装。B=10K で 1s 切りが目標
 - **新規候補**: state_transition の "realistic attestation" fixture (R≥1 + valid checkpoints + non-trivial agg_bits) で `processAttestationsFast` の N·A scaling を計測
