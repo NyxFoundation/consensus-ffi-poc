@@ -134,6 +134,10 @@ V–time は単純な線形ではなく、**V 非依存の固定費(床)+ V に�
 
 ![state_transition scaling: fixed baseline + linear-in-V (V ≤ 4096)](./assets/bench-htr-results-baseline.svg)
 
+同じ分解を全域(out-of-spec の V=1M 込み)に重ねた版が下図。spec 範囲で導いた線形項を 1M まで外挿すると **6.3 s** だが、実測 1M は **14.64 s**(≈2.3×)。spec 範囲の `床 + 線形` モデルは out-of-spec で破綻し、1M validator の実 HTR merkleize が superlinear に効く(`validator_count > 4096` は leanSpec モデルでは到達不能なので、これはあくまで mainnet 規模の対照):
+
+![state_transition scaling with baseline, full range incl. out-of-spec V=1M](./assets/bench-htr-results-baseline-full.svg)
+
 <details><summary>参考: ZERO スタブとの比較図</summary>
 
 ![real hash_tree_root cost vs ZERO stub](./assets/htr-cost.svg)
