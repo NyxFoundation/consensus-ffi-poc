@@ -72,19 +72,25 @@ elan which lean
 lake build ConsensusLean4:static
 cd rust-ffi && cargo build --release
 
-# 3. Run the benches. Default cells are sized for ~30 s / process; opt-in flags
-#    extend the axis. Per-cell `ru_maxrss` isolation needs separate invocations.
-target/release/bench-state-transition                      # N ∈ {100, 1K, 10K, 100K}
-target/release/bench-state-transition --include-1m         # + N=1M (1 trial, ~0.1 s)
-target/release/bench-fork-choice                           # B=100 × A ∈ {32, 128}
+# 3. Run the benches. The V axis is bounded by the leanSpec validator registry
+#    limit (VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096); `--include-1m` adds a
+#    mainnet out-of-spec reference. Per-cell `ru_maxrss` isolation needs separate
+#    invocations.
+target/release/bench-state-transition                      # V ∈ {4, 8, 64, 512, 4096}, A=8 valid attestations
+target/release/bench-state-transition --include-1m         # + V=1M (mainnet, out-of-spec; ~4 s, ~584 MB)
+target/release/bench-ffi-marshal                           # V ∈ {1, 4, 8, 64, 512, 4096} ByteArray marshal cost
+target/release/bench-fork-choice                           # B=100 × A ∈ {32, 128} (no V axis; B ≤ HISTORICAL_ROOTS_LIMIT=2^18)
 target/release/bench-fork-choice --include-1k              # + B=1K (~6 min/cell)
-target/release/bench-state-transition --single-n=100000    # one cell, ru_maxrss-clean
+target/release/bench-state-transition --single-n=4096      # one cell, ru_maxrss-clean
 ```
 
-Reference budgets and judgment criteria live in [`docs/timing-budget.md`](docs/timing-budget.md);
-detailed result tables are in [`docs/rust-ffi-benchmarks.md`](docs/rust-ffi-benchmarks.md).
-Crypto cost (`hash_tree_root_*`) is excluded — those return `H256.ZERO` per the spec stubs in
-`ConsensusLean4/Funs/Types.lean`.
+The `state_transition` bench loads each block with A = `MAX_ATTESTATIONS_DATA` = 8 valid
+attestations so the `O(A·V)` fast path actually runs, and asserts a fixture self-check
+(`att_cells == 9`) before timing. Reference budgets and judgment criteria live in
+[`docs/timing-budget.md`](docs/timing-budget.md); the spec-constant axis rationale and
+detailed result tables are in [`docs/rust-ffi-benchmarks.md`](docs/rust-ffi-benchmarks.md)
+(§0 pins the leanSpec / mainnet constants). Crypto cost (`hash_tree_root_*`) is excluded —
+those return `H256.ZERO` per the spec stubs in `ConsensusLean4/Funs/Types.lean`.
 
 ## Source
 
