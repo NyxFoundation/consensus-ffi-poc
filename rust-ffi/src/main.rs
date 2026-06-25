@@ -31,6 +31,7 @@ extern "C" {
 
     fn csf_ping(n: u64) -> u64;
     fn csf_selftest_sha256(seed: u64) -> u8;
+    fn csf_selftest_htr(seed: u64) -> u8;
     fn csf_smoke_state_transition_ok(seed: u64) -> u8;
     fn csf_smoke_state_transition_err(seed: u64) -> u8;
     fn csf_smoke_compute_lmd_ghost_head_empty(seed: u64) -> u8;
@@ -65,6 +66,12 @@ fn main() {
         let sha = csf_selftest_sha256(0);
         assert_eq!(sha, 0, "SHA-256(\"abc\") @[extern] self-test failed (got {sha})");
         println!("[sha] csf_selftest_sha256 → 0 ✓ (Lean→C→Rust sha2, NIST \"abc\" vector)");
+
+        // SSZ hash_tree_root self-test: uint64 LE packing + 2-leaf merkleize vs
+        // the canonical SSZ zerohashes[1] = sha256(64 zeros).
+        let htr = csf_selftest_htr(0);
+        assert_eq!(htr, 0, "SSZ hash_tree_root self-test failed (got {htr})");
+        println!("[htr] csf_selftest_htr → 0 ✓ (uint64 LE, merkleize, zerohashes[1])");
 
         // M4c stage 2: state_transition pipeline.
         let r_ok = csf_smoke_state_transition_ok(0);
