@@ -14,6 +14,11 @@
 // model where state with validator_count > 4096 fails SSZ validation.
 // Pass `--single-n=N` to run only one cell — used for per-process
 // `ru_maxrss` isolation as required by docs/ffi-feasibility.md A10.
+// Pass `--realistic` to drive the data-realistic fixture twin (scattered
+// aggregation bits + high-entropy roots) instead of the baseline synthetic one.
+// The methodology is otherwise byte-for-byte identical, so combining
+// `--realistic --single-n=N` yields clean, thermally-isolated realistic cells
+// directly comparable to the baseline §1b numbers (docs §1c).
 
 use std::env;
 use std::ffi::c_void;
@@ -43,7 +48,42 @@ extern "C" {
     // Verification probe: justifications_roots length after the pipeline.
     // 8 valid votes processed (no skip, no 2/3 bail) ⇒ 9 (incl. zero sentinel).
     fn csf_bench_state_transition_att_cells(n: u64) -> u8;
+
+    // Data-realistic twins (`--realistic`): scattered ⌈V/2⌉ aggregation bits +
+    // high-entropy H256 roots, otherwise the identical A=8 valid-vote workload.
+    // Same control path / SHA block count / cells=9 invariant as the baseline,
+    // so running them through this *same* harness makes the two directly
+    // comparable (only the fixture data differs).
+    fn csf_bench_state_transition_att_real_run(n: u64, a: u64, seed: u64) -> u8;
+    fn csf_bench_state_transition_att_real_buildonly(n: u64, a: u64, seed: u64) -> u8;
+    fn csf_bench_state_transition_att_real_cells(n: u64) -> u8;
 }
+
+/// Selects which fixture family the harness drives. The two variants share an
+/// identical signature surface, so they are interchangeable function pointers —
+/// every measurement knob (trials, calibrate, paired-delta, self-check) stays
+/// byte-for-byte the same across baseline and realistic.
+#[derive(Clone, Copy)]
+struct Fixture {
+    label: &'static str,
+    run: unsafe extern "C" fn(u64, u64, u64) -> u8,
+    buildonly: unsafe extern "C" fn(u64, u64, u64) -> u8,
+    cells: unsafe extern "C" fn(u64) -> u8,
+}
+
+const BASELINE: Fixture = Fixture {
+    label: "baseline (contiguous bits, single-byte roots)",
+    run: csf_bench_state_transition_att_run,
+    buildonly: csf_bench_state_transition_att_buildonly,
+    cells: csf_bench_state_transition_att_cells,
+};
+
+const REALISTIC: Fixture = Fixture {
+    label: "realistic (scattered bits, high-entropy roots)",
+    run: csf_bench_state_transition_att_real_run,
+    buildonly: csf_bench_state_transition_att_real_buildonly,
+    cells: csf_bench_state_transition_att_real_cells,
+};
 
 unsafe fn boot_lean() {
     lean_initialize_runtime_module();
@@ -75,16 +115,16 @@ fn ru_maxrss_kb() -> i64 {
     ru.ru_maxrss
 }
 
-fn calibrate_iters(n: u64, a: u64) -> usize {
+fn calibrate_iters(n: u64, a: u64, fx: &Fixture) -> usize {
     // 5 warmup calls to settle branch predictor / TLB, then time 20 calls
     // and back out an iter count that hits the target trial duration.
     for _ in 0..5 {
-        let _ = unsafe { csf_bench_state_transition_att_run(n, a, 0) };
+        let _ = unsafe { (fx.run)(n, a, 0) };
     }
     const SAMPLE: usize = 20;
     let t0 = Instant::now();
     for k in 0..SAMPLE {
-        let _ = unsafe { csf_bench_state_transition_att_run(n, a, k as u64) };
+        let _ = unsafe { (fx.run)(n, a, k as u64) };
     }
     let elapsed = t0.elapsed();
     let per_call_ns = (elapsed.as_nanos() / SAMPLE as u128).max(1);
@@ -105,11 +145,11 @@ struct CellResult {
     sentinel: u8,
 }
 
-fn bench_cell(n: u64, a: u64, trials: usize) -> CellResult {
+fn bench_cell(n: u64, a: u64, trials: usize, fx: &Fixture) -> CellResult {
     // Sentinel sanity: confirm the pipeline returns Ok before timing.
-    let sentinel = unsafe { csf_bench_state_transition_att_run(n, a, 0) };
+    let sentinel = unsafe { (fx.run)(n, a, 0) };
 
-    let iters = if trials == 1 { 1 } else { calibrate_iters(n, a) };
+    let iters = if trials == 1 { 1 } else { calibrate_iters(n, a, fx) };
     let mut run_per_iter: Vec<u128> = Vec::with_capacity(trials);
     let mut bo_per_iter: Vec<u128> = Vec::with_capacity(trials);
 
@@ -119,7 +159,7 @@ fn bench_cell(n: u64, a: u64, trials: usize) -> CellResult {
         let t0 = Instant::now();
         for k in 0..iters {
             let _ = unsafe {
-                csf_bench_state_transition_att_run(n, a, seed_base + k as u64)
+                (fx.run)(n, a, seed_base + k as u64)
             };
         }
         let elapsed = t0.elapsed();
@@ -128,7 +168,7 @@ fn bench_cell(n: u64, a: u64, trials: usize) -> CellResult {
         let t0 = Instant::now();
         for k in 0..iters {
             let _ = unsafe {
-                csf_bench_state_transition_att_buildonly(n, a, seed_base + k as u64)
+                (fx.buildonly)(n, a, seed_base + k as u64)
             };
         }
         let elapsed = t0.elapsed();
@@ -229,19 +269,25 @@ fn print_budget_table(results: &[CellResult]) {
 fn run() {
     let args: Vec<String> = env::args().skip(1).collect();
     let include_1m = args.iter().any(|s| s == "--include-1m");
+    let realistic = args.iter().any(|s| s == "--realistic");
     let single_n: Option<u64> = args
         .iter()
         .find_map(|s| s.strip_prefix("--single-n="))
         .and_then(|v| v.parse().ok());
 
+    let fx = if realistic { REALISTIC } else { BASELINE };
+
     unsafe { boot_lean(); }
+
+    println!("[fixture] data = {}", fx.label);
 
     // Fixture self-check: the A=8 workload only measures the STF if all 8 votes
     // are *valid*. After the pipeline `justifications_roots` must hold 9 entries
     // (zero sentinel + 8 distinct target roots). Anything else means votes were
     // skipped (invalid) or the 2/3 threshold bailed to the slow path — either way
-    // the timings below would be meaningless, so refuse to measure.
-    let cells = unsafe { csf_bench_state_transition_att_cells(64) };
+    // the timings below would be meaningless, so refuse to measure. The realistic
+    // twin must hold this same invariant (scattering bits keeps the vote count).
+    let cells = unsafe { (fx.cells)(64) };
     assert_eq!(
         cells, 9,
         "valid-vote fixture broken: expected 9 justification roots (zero sentinel + 8 \
@@ -258,13 +304,13 @@ fn run() {
     if let Some(n) = single_n {
         // Per-process cell isolation: trials count depends on cell.
         let trials = if n >= REFERENCE_N { 1 } else { 5 };
-        results.push(bench_cell(n, A_FIXED, trials));
+        results.push(bench_cell(n, A_FIXED, trials, &fx));
     } else {
         for &n in DEFAULT_N_AXIS {
-            results.push(bench_cell(n, A_FIXED, 5));
+            results.push(bench_cell(n, A_FIXED, 5, &fx));
         }
         if include_1m {
-            results.push(bench_cell(REFERENCE_N, A_FIXED, 1));
+            results.push(bench_cell(REFERENCE_N, A_FIXED, 1, &fx));
         }
     }
 
@@ -283,6 +329,19 @@ fn run() {
     println!("| ru_maxrss start | {} MB |", rss_start / 1024);
     println!("| ru_maxrss end | {} MB |", rss_end / 1024);
     println!("| ru_maxrss delta | {} MB |", (rss_end - rss_start) / 1024);
+
+    // Machine-readable block for the SVG generator (raw ns, no formatting loss).
+    // One row per cell: V,pipeline_ns,run_median_ns,buildonly_ns,sentinel.
+    println!();
+    println!("<!-- PLOTDATA fixture={}", if realistic { "realistic" } else { "baseline" });
+    println!("V,pipeline_ns,run_median_ns,buildonly_ns,sentinel");
+    for r in &results {
+        println!(
+            "{},{},{},{},{}",
+            r.n, r.pipeline_ns, r.run_median_ns, r.bo_median_ns, r.sentinel
+        );
+    }
+    println!("-->");
 }
 
 fn main() {
