@@ -1,24 +1,20 @@
-// M5b — state_transition V-axis bench harness (spec-realistic).
+// state_transition V-axis bench harness (realistic attestation fixture).
 //
-// Drives `csf_bench_state_transition_att_run` and its `_buildonly` paired-delta
-// twin. The block carries A = MAX_ATTESTATIONS_DATA = 8 *valid* attestations so
-// the O(A·V) fast path (processAttestationsFast) actually runs — unlike the
-// earlier empty-block fixture, which measured only validator-Vec construction.
-// Builders live entirely on the Lean side (cf. ConsensusLean4/Ffi.lean M5b
-// section) so the harness only passes primitive `u64` arguments.
+// Drives `csf_bench_state_transition_att_real_run` and its `_buildonly`
+// paired-delta twin. The block carries A = MAX_ATTESTATIONS_DATA = 8 *valid*
+// attestations (scattered aggregation bits + high-entropy roots = real
+// attestation data shape) so the O(A·V) fast path (processAttestationsFast)
+// actually runs. Builders live entirely on the Lean side (cf.
+// ConsensusLean4/Ffi.lean) so the harness only passes primitive `u64` arguments.
 //
 // V axis is leanSpec-bounded: VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096
 // (forks/lstar/config.py). Default cells: V ∈ {4, 8, 64, 512, 4096} × 5 trials.
 // Pass `--include-1m` to add V=1M with 1 trial — a *mainnet out-of-spec
 // reference* (real beacon chain ~1M validators), physically unreachable in this
 // model where state with validator_count > 4096 fails SSZ validation.
-// Pass `--single-n=N` to run only one cell — used for per-process
-// `ru_maxrss` isolation as required by docs/ffi-feasibility.md A10.
-// Pass `--realistic` to drive the data-realistic fixture twin (scattered
-// aggregation bits + high-entropy roots) instead of the baseline synthetic one.
-// The methodology is otherwise byte-for-byte identical, so combining
-// `--realistic --single-n=N` yields clean, thermally-isolated realistic cells
-// directly comparable to the baseline §1b numbers (docs §1c).
+// Pass `--single-n=N` to run only one cell — per-process `ru_maxrss` isolation
+// as required by docs/ffi-feasibility.md A10, yielding clean, thermally-isolated
+// cells (docs §1c).
 
 use std::env;
 use std::ffi::c_void;
@@ -43,26 +39,17 @@ extern "C" {
         world: *mut c_void,
     ) -> *mut c_void;
 
-    fn csf_bench_state_transition_att_run(n: u64, a: u64, seed: u64) -> u8;
-    fn csf_bench_state_transition_att_buildonly(n: u64, a: u64, seed: u64) -> u8;
-    // Verification probe: justifications_roots length after the pipeline.
-    // 8 valid votes processed (no skip, no 2/3 bail) ⇒ 9 (incl. zero sentinel).
-    fn csf_bench_state_transition_att_cells(n: u64) -> u8;
-
-    // Data-realistic twins (`--realistic`): scattered ⌈V/2⌉ aggregation bits +
-    // high-entropy H256 roots, otherwise the identical A=8 valid-vote workload.
-    // Same control path / SHA block count / cells=9 invariant as the baseline,
-    // so running them through this *same* harness makes the two directly
-    // comparable (only the fixture data differs).
+    // Realistic A=8 valid-vote fixture: scattered ⌈V/2⌉ aggregation bits +
+    // high-entropy H256 roots = real attestation data shape. `_cells` is a
+    // verification probe — justifications_roots length after the pipeline; with
+    // 8 valid votes (no skip, no 2/3 bail) it is 9 (incl. zero sentinel).
     fn csf_bench_state_transition_att_real_run(n: u64, a: u64, seed: u64) -> u8;
     fn csf_bench_state_transition_att_real_buildonly(n: u64, a: u64, seed: u64) -> u8;
     fn csf_bench_state_transition_att_real_cells(n: u64) -> u8;
 }
 
-/// Selects which fixture family the harness drives. The two variants share an
-/// identical signature surface, so they are interchangeable function pointers —
-/// every measurement knob (trials, calibrate, paired-delta, self-check) stays
-/// byte-for-byte the same across baseline and realistic.
+/// The fixture the harness drives, as interchangeable function pointers so every
+/// measurement knob (trials, calibrate, paired-delta, self-check) is shared.
 #[derive(Clone, Copy)]
 struct Fixture {
     label: &'static str,
@@ -70,13 +57,6 @@ struct Fixture {
     buildonly: unsafe extern "C" fn(u64, u64, u64) -> u8,
     cells: unsafe extern "C" fn(u64) -> u8,
 }
-
-const BASELINE: Fixture = Fixture {
-    label: "baseline (contiguous bits, single-byte roots)",
-    run: csf_bench_state_transition_att_run,
-    buildonly: csf_bench_state_transition_att_buildonly,
-    cells: csf_bench_state_transition_att_cells,
-};
 
 const REALISTIC: Fixture = Fixture {
     label: "realistic (scattered bits, high-entropy roots)",
@@ -269,13 +249,12 @@ fn print_budget_table(results: &[CellResult]) {
 fn run() {
     let args: Vec<String> = env::args().skip(1).collect();
     let include_1m = args.iter().any(|s| s == "--include-1m");
-    let realistic = args.iter().any(|s| s == "--realistic");
     let single_n: Option<u64> = args
         .iter()
         .find_map(|s| s.strip_prefix("--single-n="))
         .and_then(|v| v.parse().ok());
 
-    let fx = if realistic { REALISTIC } else { BASELINE };
+    let fx = REALISTIC;
 
     unsafe { boot_lean(); }
 
@@ -285,8 +264,8 @@ fn run() {
     // are *valid*. After the pipeline `justifications_roots` must hold 9 entries
     // (zero sentinel + 8 distinct target roots). Anything else means votes were
     // skipped (invalid) or the 2/3 threshold bailed to the slow path — either way
-    // the timings below would be meaningless, so refuse to measure. The realistic
-    // twin must hold this same invariant (scattering bits keeps the vote count).
+    // the timings below would be meaningless, so refuse to measure (scattering the
+    // aggregation bits keeps the vote count, so this invariant still holds).
     let cells = unsafe { (fx.cells)(64) };
     assert_eq!(
         cells, 9,
@@ -333,7 +312,7 @@ fn run() {
     // Machine-readable block for the SVG generator (raw ns, no formatting loss).
     // One row per cell: V,pipeline_ns,run_median_ns,buildonly_ns,sentinel.
     println!();
-    println!("<!-- PLOTDATA fixture={}", if realistic { "realistic" } else { "baseline" });
+    println!("<!-- PLOTDATA fixture=realistic");
     println!("V,pipeline_ns,run_median_ns,buildonly_ns,sentinel");
     for r in &results {
         println!(

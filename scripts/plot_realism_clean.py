@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 """Generate docs/assets/bench-realism-clean.svg — STF processing time vs validators,
-measured under clean single-process isolation on the real-data-shaped fixture.
+measured under clean single-process isolation on the realistic attestation fixture.
 
 This is the §1b clean harness `bench-state-transition` run once per V in its OWN
-process (`--single-n=N`, `--realistic` to select the real-data fixture), with a
-cooldown before every process so the boost clock is not depressed by sustained
-load. Unlike plot_realism_abs.py (whose data comes from the sustained-load
-`bench-state-transition-realism` binary that keeps the CPU under continuous
-load), each cell here is thermally isolated.
+process (`--single-n=N`), with a cooldown before every process so the boost clock
+is not depressed by sustained load — each cell is thermally isolated.
 
 The plotted curve is the realistic fixture (scattered aggregation bits +
 high-entropy roots — the data shape that represents real attestations); it is the
-canonical clean STF cost. The synthetic foil fixture was measured through the
-same harness only to confirm the data shape does not change the cost (see §1c A/B
-in docs/rust-ffi-benchmarks.md); its raw numbers are kept in RUNS for provenance
-but are not plotted.
+canonical clean STF cost.
 
 The pipeline time is the paired delta run − buildonly median, i.e. the
 state_transition cost with its fixture-construction overhead cancelled out.
@@ -36,27 +30,23 @@ matplotlib.use("Agg")
 matplotlib.rcParams["svg.fonttype"] = "none"
 import matplotlib.pyplot as plt
 
-# (V, foil_ns, realistic_ns) per round — verbatim pipeline Δ from the clean
-# per-process runs (run − buildonly median). 3 rounds, each cell its own process.
-# Only the realistic column is plotted; the foil column is the raw record.
+# (V, realistic_ns) per round — verbatim pipeline Δ from the clean per-process
+# runs (run − buildonly median). 3 rounds, each cell its own process.
 RUNS = [
-    [(4, 500505, 484011), (8, 494727, 513860), (64, 1147906, 1221616),
-     (512, 5770899, 6099421), (4096, 41362683, 41963933)],
-    [(4, 465938, 492497), (8, 523817, 530381), (64, 1110647, 1196569),
-     (512, 5786186, 5788166), (4096, 42110075, 41900606)],
-    [(4, 469475, 507212), (8, 546896, 503244), (64, 1097685, 1184341),
-     (512, 5864254, 6045838), (4096, 42060853, 43892274)],
+    [(4, 484011), (8, 513860), (64, 1221616), (512, 6099421), (4096, 41963933)],
+    [(4, 492497), (8, 530381), (64, 1196569), (512, 5788166), (4096, 41900606)],
+    [(4, 507212), (8, 503244), (64, 1184341), (512, 6045838), (4096, 43892274)],
 ]
 
 VS = [4, 8, 64, 512, 4096]
 
 
-def collect(idx):
-    """Return {V: [ns across rounds]} for column idx (2=realistic)."""
+def collect():
+    """Return {V: [ns across rounds]} for the realistic pipeline Δ."""
     out = {v: [] for v in VS}
     for run in RUNS:
         for row in run:
-            out[row[0]].append(row[idx])
+            out[row[0]].append(row[1])
     return out
 
 
@@ -69,7 +59,7 @@ def stats_us(series):
 
 
 def main():
-    med, lo, hi = stats_us(collect(2))
+    med, lo, hi = stats_us(collect())
 
     fig, ax = plt.subplots(figsize=(7.2, 4.4))
 
