@@ -168,6 +168,84 @@ native Rust 実装が全域で **3.6–5.3× 速い**。差は Aeneas 生成コ�
 - **att_cells = 9 を維持**: 実 HTR 化後も 8 票はすべて有効処理(root 整合化は投票の有効性に影響しない)。
 - **依然 STF 外**: 署名検証(XMSS/Poseidon)は未計測(§4e ①)。本節は「実 HTR 込み・署名検証なし」の値。
 
+## 1c. データリアリズム A/B — 合成 fixture の楽観バイアス検証
+
+§1/§1b の fixture は attestation の `aggregation_bits` を**連続 ⌈V/2⌉ ビット接頭辞**(`true` が前半に固まる)で、H256 root を**単一バイト 32 連**(`hashOfNat`)で構築する。どちらも STF を実データより*測りやすく*する経路を持つ:
+
+- **分岐予測**: 連続接頭辞は `processAttestationsFast` の `aggregation_bits` 走査(`FastPath.lean:133`)で分岐予測がほぼ完璧に当たる。実 attestation の散らばったビットなら mispredict が増えうる。
+- **比較短絡**: 単一バイト root は相異なる root が**バイト 0 で分岐**するため `H256` 等価比較・`is_zero` が即短絡する。
+
+本節はこれを定量化するため、同一ワークロード(同 V、同 8 有効票、同 no-bail / `cells = 9` 不変)の **data-realistic twin**(`csf_bench_state_transition_att_real_*`)を作って A/B 計測した:
+
+- **散らばったビット**: `mix64`(splitmix64)を RNG とする固定 Fisher-Yates で、**正確に ⌈V/2⌉ 個**の set ビットを無秩序な位置に配置(`scatteredBitList`)。票数は不変なので 2/3 閾値に当たらず fast path を維持。
+- **高エントロピー root**: `mix64` 由来のバイト列(`hashOfNatHE`、非ゼロ・index について injective)。
+- V / A / SHA ブロック数 / 制御パスはすべて baseline と同一 ⇒ **realistic ≥ baseline ならその差が "データパターン由来の楽観バイアス"**。両 fixture とも `_real_cells = 9` を assert してから計測。
+- **同一プロセスで baseline と realistic を各 V で交互計測**(cache/thermal 状態を共有した公平な A/B)。独立 4 プロセス × 各 7 試行中央値。
+
+### 計測結果 (V = 4 … 4096、A=8 valid votes、4 プロセスの中央値)
+
+| V | baseline Δ | realistic Δ | realistic / baseline |
+|---:|---:|---:|---:|
+| 4 | 487.9 µs | 523.4 µs | 1.073× |
+| 8 | 541.6 µs | 542.7 µs | 1.002× |
+| 64 | 1.13 ms | 1.14 ms | 1.014× |
+| 512 | 5.90 ms | 5.83 ms | 0.989× |
+| 4096 (spec max) | 45.18 ms | 43.28 ms | 0.958× |
+
+![synthetic vs data-realistic state_transition fixture](./assets/bench-realism.svg)
+
+同じ 4 ラン分のデータを、比ではなく **STF 処理時間の絶対値 × Validator 数**(他節の scaling 図と同じ log-log)で見たもの。baseline / realistic の 2 本が全 V でノイズ内に重なり、データパターンが pipeline 時間を動かさないことを別表現で示す:
+
+![STF processing time vs validators (realism A/B, absolute)](./assets/bench-realism-abs.svg)
+
+### 判定・観察
+
+- **realistic ≈ baseline(全 V で 0.96–1.07×)、一貫した方向なし**。realistic が速い V も遅い V もある。実行間ノイズ(同一セルで ±10–24%、特に V=512 は 4 プロセスで 0.89–1.10× に振れる)に対し、A/B 差は ±5–7% でその**ノイズ以下**。→ **散らばったビット＋高エントロピー root は STF pipeline の実測時間を有意に変えない**。
+- **なぜ効かないか**: pipeline は (1) 値非依存の SHA-256 `hash_tree_root`(大 V で支配、§1b の HTR 増分 +82%)と (2) ループ上限が `bits.size = V` の**無条件 O(A·V) ビット走査**が支配する。仮説していた分岐予測・比較短絡のコストは、これらに対して小さくノイズに埋もれる。
+- **含意**: §1/§1b の合成 fixture の数字は、fixture の規則性に対して**頑健**。データを現実寄りにしても headline は動かない(少なくとも測定ノイズの範囲で)。
+- **絶対値の注記**: 本節の絶対 Δ は §1b の run(V=4096 で 27.55 ms)より高い(~45 ms)。当初これを「持続負荷の熱ダレ」と見ていたが、下の**クリーン単独プロセス隔離**で測り直すと熱ダレを排しても ~42 ms とほぼ変わらず、絶対水準は**計測時刻のマシン熱状態**に支配されることが分かった(§1b の 27.55 ms は同日でもより冷えた時刻の値)。よって**横断の絶対比較は同一セッション内**で、本節の主眼は同一実行内の相対比とすること。詳細は下のクリーン節を参照。
+- **再現**: `cargo build --release --bin bench-state-transition-realism` 後に `rust-ffi/target/release/bench-state-transition-realism`。SVG は `python3 scripts/plot_realism.py`(realistic/baseline 比)と `python3 scripts/plot_realism_abs.py`(STF 処理時間の絶対値、同じ埋め込みデータから再生成)。
+
+### クリーン単独プロセス隔離 — realistic fixture を §1b 方法論で実測
+
+上の §1c は `bench-state-transition-realism` で CPU を連続負荷下に置く(baseline / realistic を 1 プロセスで交互 + セル毎 calibrate)。本節はこれと別物で、**§1b と同一のクリーン方法論**(単独プロセス隔離)で realistic fixture(散らばったビット＋高エントロピー root = 実 attestation のデータ形状)を測り、**実データ寄りの canonical な clean STF コスト**を出した:
+
+- **同一ハーネス**: §1b の clean harness `bench-state-transition` に `--realistic` フラグを追加し、realistic fixture export(`csf_bench_state_transition_att_real_*`)を選択する。trials / calibrate / paired-delta / self-check(`att_cells(64) == 9`)は §1b と byte-for-byte 同一。
+- **単独プロセス隔離**: 各 V を `--single-n=N` で**別プロセス**実行(1 プロセス 1 セル)。
+- **cooldown**: 各プロセスの前に 20 s スリープを挟み、ブーストクロックが持続負荷で落ちないようにする。
+- **idle マシン**: 常駐負荷を止め、CPU 95% idle を確認した状態で計測。各 V を 3 プロセスずつ回し中央値を取る。
+- データ形状が STF 時間を有意に変えないことは §1c 上段の A/B で確認済み ⇒ 本節は**実データ形状の realistic 値のみ**を canonical として報告する(合成データの値は対照 foil であって canonical ではない)。
+
+#### 計測環境
+
+| 項目 | 値 |
+|---|---|
+| CPU | AMD Ryzen 9 PRO 8945HS (16 threads, Radeon 780M) |
+| governor / EPP / boost | performance / performance / on(最大 5.26 GHz、未制限) |
+| OS / kernel | Kali Linux Rolling 2025.4 / 6.18.12 |
+| 日付 | 2026-06-26 ~10:00 JST |
+| マシン状態 | idle(常駐 clickhouse コンテナ凍結、瞬間 CPU 95% idle を確認) |
+
+#### 計測結果 (V = 4 … 4096、A=8 valid votes、各 V を 3 プロセスの中央値)
+
+| V | realistic clean Δ | 3-run min..max | 参考 §1c 持続負荷 realistic |
+|---:|---:|---:|---:|
+| 4 | 492.5 µs | 484.0–507.2 µs | 523.4 µs |
+| 8 | 513.9 µs | 503.2–530.4 µs | 542.7 µs |
+| 64 | 1.197 ms | 1.184–1.222 ms | 1.14 ms |
+| 512 | 6.046 ms | 5.788–6.099 ms | 5.83 ms |
+| 4096 (spec max) | 41.96 ms | 41.90–43.89 ms | 43.28 ms |
+
+![state_transition processing time vs validators (clean single-process isolation)](./assets/bench-realism-clean.svg)
+
+#### 判定・観察
+
+- **spec 上限 V=4096 で 41.96 ms、🟢 green**(SLO target 200 ms の ~1/5)。実データ形状でも 1 スロット ~4 s に対し余裕。scaling は V に概ね線形〜やや超線形(大 V で SHA-256 HTR が支配)。
+- **絶対値はマシン熱状態に支配される**: クリーン V=4096 = 41.96 ms は、**同日**(2026-06-26)の §1c 持続負荷 realistic(43.28 ms)とほぼ一致する。より早い時刻(00:40、より冷えたマシン)では同 V が大幅に低かった(§1b は 27.55 ms)が、その後(02:33 以降〜本計測 10:00)は run / buildonly がともに一律 ~1.48× 遅い(run 112 ms vs 75.68 ms、buildonly 70 ms vs 48 ms)= クロックが下がった状態が続いた。つまり §1c 上段の 45 ms と §1b の 27.55 ms の差は「持続負荷の熱ダレ」ではなく**計測時刻 = マシン熱状態の差**であり、単独プロセス隔離だけでは低い絶対値は再現しない(電力設定は計測時すでに最大: performance gov / EPP=performance / boost / 5.26 GHz 未制限)。
+- **3 プロセスのばらつきは小さい**(V=4096: 41.90–43.89 ms。ラウンド進行で上昇トレンドなし ⇒ 残留熱の人工物ではない安定 steady-state)。
+- **含意**: STF の絶対 µs/ms はセッション間のマシン熱状態に敏感なので、**横断の絶対比較は同一セッション内**で取った値どうしで行うこと。絶対の水準は当日のマシン状態に読み替える。
+- **再現**: `cargo build --release --bin bench-state-transition` 後、各 V を別プロセスで `rust-ffi/target/release/bench-state-transition --realistic --single-n=$N`、各実行前に cooldown。SVG は `python3 scripts/plot_realism_clean.py`(実測 ns をスクリプトに直接埋め込み)。
+
 ## 2. `compute_lmd_ghost_head` (Aeneas direct, no fast path)
 
 軸: (B blocks, A attestations) ∈ `{100} × {32, 128}` × 5 試行 (default)。
@@ -223,6 +301,7 @@ cd rust-ffi && cargo build --release
 # 3. ベンチ実行 (per-cell isolation 推奨: cargo run はせず target/release を直接呼ぶ)
 target/release/bench-state-transition                      # V=4,8,64,512,4096, A=8 valid (~4 s)
 target/release/bench-state-transition --include-1m         # + V=1M (out-of-spec ref、1 trial ~4 s + ~584 MB rss、2 GiB stack)
+target/release/bench-state-transition-realism              # §1c data-realism A/B (synthetic vs scattered-bits + high-entropy roots)
 target/release/bench-ffi-marshal                           # V=1..4096 marshal (~数 s)
 target/release/bench-ffi-marshal --include-1m              # + V=1M (out-of-spec, ~57 MB payload)
 target/release/bench-fork-choice                           # B=100 × A=32,128 (~20 s、V 軸なし)
@@ -233,6 +312,10 @@ target/release/bench-state-transition --single-n=4096
 target/release/bench-state-transition --single-n=1000000
 target/release/bench-fork-choice --single-cell=100,32
 target/release/bench-fork-choice --single-cell=100,128
+
+# §1c クリーン単独プロセス隔離 (realistic fixture を §1b と同一方法論で):
+target/release/bench-state-transition --realistic --single-n=4096   # realistic data
+target/release/bench-state-transition --single-n=4096               # baseline data (同一ハーネス)
 ```
 
 ## 4b. FFI 境界コスト 追測 (2026-06-04)
