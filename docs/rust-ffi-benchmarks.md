@@ -118,8 +118,47 @@ log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spe
 | 64 | 1.83 ms | 1.06 ms | **761.9 µs** | 536.2 µs | +42% | 0 |
 | 512 | 10.91 ms | 7.36 ms | **3.55 ms** | 2.15 ms | +65% | 0 |
 | 4096 (spec max) | 75.68 ms | 48.14 ms | **27.55 ms** | 15.12 ms | **+82%** | 0 |
+| 1,000,000 ⚠ out-of-spec | 30.16 s | 15.53 s | **14.64 s** | 4.17 s | **+251%** | 0 |
+
+> V=1M は mainnet 範囲外参考(`--include-1m`、1 trial、RSS +1.27 GB)。実 HTR の merkleize(1M validator を SHA-256)が支配し、スタブ時 4.17 s の ~3.5× に。leanSpec モデルでは `validator_count > 4096` は SSZ 検証で不正のため到達不能。
+
+![state_transition results with SHA-256 hash_tree_root](./assets/bench-htr-results.svg)
+
+SHA-256 `hash_tree_root` 込みの STF pipeline。spec 上限 V=4096 で 26.40 ms ≪ SLO target 200 ms(約 1/8)。赤の破線・網掛けは out-of-spec の V=1M(mainnet 参考、`--include-1m`)で **14.64 s**(🔴、RSS +1.27 GB) — `validator_count > 4096` は leanSpec モデルでは到達不能。HTR が実計算になったことで 1M の merkleize(1M validator を SHA-256 で畳む)が支配し、HTR スタブ時の 4.17 s から ~3.5× に増えた。データは 1 プロセスの canonical run(2026-06-26, AMD Ryzen 9 PRO 8945HS)。
+
+上図は V=1M を含むため spec 範囲(V ≤ 4096)の曲線が縦軸の下端に圧縮される。spec 範囲だけを拡大した版が下図(同一データ、軸を 200 ms SLO 近傍までズーム):
+
+![state_transition results (leanSpec range V ≤ 4096)](./assets/bench-htr-results-spec.svg)
+
+V–time は単純な線形ではなく、**V 非依存の固定費(床)+ V に線形な項**のアフィン関係 `t ≈ 0.30 ms + 6.3 µs·V`。下図はこれを分解し、固定費ベースライン(紫の水平線、~0.30 ms: 8 票分の `voteIsValid` 等)と線形項(橙、~6.3 µs·V: `O(A·V)` ホットループ + HTR merkleize)を明示した版。実測(青)は小 V で床に、大 V で線形項に漸近し、両者が交差する **V≈48** が平坦→線形の膝になる(V を 8× しても time 倍率が 2.07→5.41→6.86 と 8× に近づくのはこのため):
+
+![state_transition scaling: fixed baseline + linear-in-V (V ≤ 4096)](./assets/bench-htr-results-baseline.svg)
+
+同じ分解を全域(out-of-spec の V=1M 込み)に重ねた版が下図。spec 範囲で導いた線形項を 1M まで外挿すると **6.3 s** だが、実測 1M は **14.64 s**(≈2.3×)。spec 範囲の `床 + 線形` モデルは out-of-spec で破綻し、1M validator の実 HTR merkleize が superlinear に効く(`validator_count > 4096` は leanSpec モデルでは到達不能なので、これはあくまで mainnet 規模の対照):
+
+![state_transition scaling with baseline, full range incl. out-of-spec V=1M](./assets/bench-htr-results-baseline-full.svg)
+
+#### 別の native Rust 実装との対照
+
+同じ Lean Consensus (3SF) プロトコルの**独立した native Rust 実装**(spec 定数も一致: `VALIDATOR_REGISTRY_LIMIT = 4096`、`MAX_ATTESTATIONS_DATA = 8`、`HISTORICAL_ROOTS_LIMIT = 262144`、HTR も SSZ merkleize over **SHA-256**)と対照した。本 poc と同条件(V ≤ 4096、A=8 有効 attestation、HTR 込み)でその実装の `state_transition` を計測(consistent block を構築、State の clone は計測外、median of N samples、同一マシン 2026-06-26)。
+
+| V | native Rust 実装 | consensus-ffi-poc (Lean/FFI) | 比 |
+|---:|---:|---:|---:|
+| 4 | 61.1 µs | 324 µs | 5.3× |
+| 8 | 67.6 µs | 344 µs | 5.1× |
+| 64 | 165.7 µs | 712 µs | 4.3× |
+| 512 | 939.7 µs | 3.85 ms | 4.1× |
+| 4096 (spec max) | **7.41 ms** | **26.40 ms** | **3.6×** |
+
+![state_transition: consensus-ffi-poc (Lean/FFI) vs native-Rust implementation, V ≤ 4096](./assets/bench-htr-results-spec-vs-native-rust.svg)
+
+native Rust 実装が全域で **3.6–5.3× 速い**。差は Aeneas 生成コード + Lean ランタイム + FFI 境界のオーバーヘッドで、これは検証由来ではなく純粋に実装パスのコスト(§前提どおり handwritten fast path でも Lean の `Array`/boxed `lean_object*` を経由する)。**両者とも spec 上限 V=4096 で SLO target 200 ms を大きく下回る**(7.41 ms / 26.40 ms、ともに 🟢)。scaling は両者とも V=512→4096 で ~linear(native Rust 940 µs→7.41 ms ≈ 7.9×、poc 3.85→26.40 ms ≈ 6.9×)で、§前述の `O(A·V) + HTR merkleize` モデルが実装非依存に効いていることを裏づける。
+
+<details><summary>参考: ZERO スタブとの比較図</summary>
 
 ![real hash_tree_root cost vs ZERO stub](./assets/htr-cost.svg)
+
+</details>
 
 ### 判定・観察
 
