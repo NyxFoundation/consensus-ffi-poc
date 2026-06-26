@@ -155,13 +155,17 @@ log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spe
 
 ![synthetic vs data-realistic state_transition fixture](./assets/bench-realism.svg)
 
+同じ 4 ラン分のデータを、比ではなく **STF 処理時間の絶対値 × Validator 数**(他節の scaling 図と同じ log-log)で見たもの。baseline / realistic の 2 本が全 V でノイズ内に重なり、データパターンが pipeline 時間を動かさないことを別表現で示す:
+
+![STF processing time vs validators (realism A/B, absolute)](./assets/bench-realism-abs.svg)
+
 ### 判定・観察
 
 - **realistic ≈ baseline(全 V で 0.96–1.07×)、一貫した方向なし**。realistic が速い V も遅い V もある。実行間ノイズ(同一セルで ±10–24%、特に V=512 は 4 プロセスで 0.89–1.10× に振れる)に対し、A/B 差は ±5–7% でその**ノイズ以下**。→ **散らばったビット＋高エントロピー root は STF pipeline の実測時間を有意に変えない**。
 - **なぜ効かないか**: pipeline は (1) 値非依存の SHA-256 `hash_tree_root`(大 V で支配、§1b の HTR 増分 +82%)と (2) ループ上限が `bits.size = V` の**無条件 O(A·V) ビット走査**が支配する。仮説していた分岐予測・比較短絡のコストは、これらに対して小さくノイズに埋もれる。
 - **含意**: §1/§1b の合成 fixture の数字は、fixture の規則性に対して**頑健**。データを現実寄りにしても headline は動かない(少なくとも測定ノイズの範囲で)。
 - **絶対値の注記**: 本節の絶対 Δ は §1b の canonical run(V=4096 で 27.55 ms)より高い(~45 ms)。これは baseline/realistic を interleave しつつ各セルで calibrate を回す持続負荷下の値で、熱・キャッシュ条件が §1b と異なるため。**本節の主眼は同一実行内の相対比**であり、絶対の正準値は §1b を参照。
-- **再現**: `cargo build --release --bin bench-state-transition-realism` 後に `rust-ffi/target/release/bench-state-transition-realism`。SVG は `python3 scripts/plot_realism.py`(埋め込みデータから再生成)。
+- **再現**: `cargo build --release --bin bench-state-transition-realism` 後に `rust-ffi/target/release/bench-state-transition-realism`。SVG は `python3 scripts/plot_realism.py`(realistic/baseline 比)と `python3 scripts/plot_realism_abs.py`(STF 処理時間の絶対値、同じ埋め込みデータから再生成)。
 
 ## 2. `compute_lmd_ghost_head` (Aeneas direct, no fast path)
 
