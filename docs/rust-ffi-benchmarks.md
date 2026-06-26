@@ -167,14 +167,15 @@ log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spe
 - **絶対値の注記**: 本節の絶対 Δ は §1b の run(V=4096 で 27.55 ms)より高い(~45 ms)。当初これを「持続負荷の熱ダレ」と見ていたが、下の**クリーン単独プロセス隔離**で測り直すと熱ダレを排しても ~42 ms とほぼ変わらず、絶対水準は**計測時刻のマシン熱状態**に支配されることが分かった(§1b の 27.55 ms は同日でもより冷えた時刻の値)。よって**横断の絶対比較は同一セッション内**で、本節の主眼は同一実行内の相対比とすること。詳細は下のクリーン節を参照。
 - **再現**: `cargo build --release --bin bench-state-transition-realism` 後に `rust-ffi/target/release/bench-state-transition-realism`。SVG は `python3 scripts/plot_realism.py`(realistic/baseline 比)と `python3 scripts/plot_realism_abs.py`(STF 処理時間の絶対値、同じ埋め込みデータから再生成)。
 
-### クリーン単独プロセス隔離 — realistic を §1b と同一方法論で実測
+### クリーン単独プロセス隔離 — realistic fixture を §1b 方法論で実測
 
-上の §1c は `bench-state-transition-realism` で baseline / realistic を **1 プロセスで交互**かつセル毎 calibrate で連続実行する。CPU が走りっぱなしになるため、そこで測る絶対値は持続負荷下の値になる(本節冒頭の注記参照)。本節はこれを **§1b と完全に同一のクリーン方法論**(単独プロセス隔離)で測り直した別物の計測である:
+上の §1c は `bench-state-transition-realism` で CPU を連続負荷下に置く(baseline / realistic を 1 プロセスで交互 + セル毎 calibrate)。本節はこれと別物で、**§1b と同一のクリーン方法論**(単独プロセス隔離)で realistic fixture(散らばったビット＋高エントロピー root = 実 attestation のデータ形状)を測り、**実データ寄りの canonical な clean STF コスト**を出した:
 
-- **同一ハーネス**: §1b の clean harness `bench-state-transition` に `--realistic` フラグを追加し、realistic fixture export(`csf_bench_state_transition_att_real_*`)を選択する。trials / calibrate / paired-delta / self-check(`att_cells(64) == 9`)はすべて baseline と byte-for-byte 同一 ⇒ 同一ハーネス上で baseline と realistic が直接比較可能。
+- **同一ハーネス**: §1b の clean harness `bench-state-transition` に `--realistic` フラグを追加し、realistic fixture export(`csf_bench_state_transition_att_real_*`)を選択する。trials / calibrate / paired-delta / self-check(`att_cells(64) == 9`)は §1b と byte-for-byte 同一。
 - **単独プロセス隔離**: 各 V を `--single-n=N` で**別プロセス**実行(1 プロセス 1 セル)。
 - **cooldown**: 各プロセスの前に 20 s スリープを挟み、ブーストクロックが持続負荷で落ちないようにする。
-- **idle マシン**: 常駐負荷を止め、CPU 95% idle を確認した状態で計測。realistic / baseline 各 V を 3 プロセスずつ回し中央値を取る。
+- **idle マシン**: 常駐負荷を止め、CPU 95% idle を確認した状態で計測。各 V を 3 プロセスずつ回し中央値を取る。
+- データ形状が STF 時間を有意に変えないことは §1c 上段の A/B で確認済み ⇒ 本節は**実データ形状の realistic 値のみ**を canonical として報告する(合成データの値は対照 foil であって canonical ではない)。
 
 #### 計測環境
 
@@ -188,24 +189,23 @@ log-log。実線 = spec 範囲 (V ≤ 4096)、破線 + 赤網掛け = out-of-spe
 
 #### 計測結果 (V = 4 … 4096、A=8 valid votes、各 V を 3 プロセスの中央値)
 
-| V | baseline clean Δ | realistic clean Δ | realistic / baseline | 参考 §1b(より冷, 00:40) | 参考 §1c 持続負荷 realistic |
-|---:|---:|---:|---:|---:|---:|
-| 4 | 469.5 µs | 492.5 µs | 1.049× | 315.5 µs | 523.4 µs |
-| 8 | 523.8 µs | 513.9 µs | 0.981× | 369.6 µs | 542.7 µs |
-| 64 | 1.111 ms | 1.197 ms | 1.077× | 761.9 µs | 1.14 ms |
-| 512 | 5.786 ms | 6.046 ms | 1.045× | 3.55 ms | 5.83 ms |
-| 4096 (spec max) | 42.06 ms | 41.96 ms | 0.998× | 27.55 ms | 43.28 ms |
-
-3 プロセスのばらつきは小さい(V=4096 baseline: 41.36–42.11 ms。ラウンド進行で上昇トレンドなし ⇒ 残留熱の人工物ではない安定 steady-state)。
+| V | realistic clean Δ | 3-run min..max | 参考 §1c 持続負荷 realistic |
+|---:|---:|---:|---:|
+| 4 | 492.5 µs | 484.0–507.2 µs | 523.4 µs |
+| 8 | 513.9 µs | 503.2–530.4 µs | 542.7 µs |
+| 64 | 1.197 ms | 1.184–1.222 ms | 1.14 ms |
+| 512 | 6.046 ms | 5.788–6.099 ms | 5.83 ms |
+| 4096 (spec max) | 41.96 ms | 41.90–43.89 ms | 43.28 ms |
 
 ![state_transition processing time vs validators (clean single-process isolation)](./assets/bench-realism-clean.svg)
 
 #### 判定・観察
 
-- **realistic ≈ baseline はクリーン隔離でも成立**: 全 V で 0.98–1.08×、一貫した方向なし。持続負荷の §1c 上段と同じ結論 ——「散らばったビット＋高エントロピー root は STF pipeline の実測時間を有意に変えない」—— が、熱ダレを排した単独プロセス条件でも再確認できた。これが本節の制御された結論(同一セッション・同一条件での比較)。
-- **絶対値はマシン熱状態に支配される(クリーン隔離 ≠ §1b の 27.55 ms)**: クリーン V=4096 = 42.06 ms は、**同日**(2026-06-26)に測った §1c 持続負荷の 43–45 ms とほぼ一致する。§1b の 27.55 ms は同日でも**より早い時刻(00:40、より冷えたマシン)**の値で、その後(02:33 以降〜本計測 10:00)は run / buildonly がともに一律 ~1.48× 遅い(run 112 ms vs 75.68 ms、buildonly 70 ms vs 48 ms)= クロックが下がった状態が続いた。つまり §1c 上段の 45 ms と §1b の 27.55 ms の差は「持続負荷の熱ダレ」ではなく**計測時刻=マシン熱状態の差**であり、単独プロセス隔離だけでは 27.55 ms は再現しない(電力設定は計測時すでに最大: performance gov / EPP=performance / boost / 5.26 GHz 未制限)。
-- **含意**: STF の絶対 µs/ms はセッション間のマシン熱状態に敏感なので、**横断比較は同一セッション内**で取った値どうしで行うこと(本節の realistic-vs-baseline、および §1c 上段の interleave 比がそれに当たる)。絶対の水準は当日のマシン状態に読み替える。V=4096 でも 42 ms で 🟢 green(SLO target 200 ms の ~1/5)は §1b と同じく余裕。
-- **再現**: `cargo build --release --bin bench-state-transition` 後、各 V を別プロセスで `rust-ffi/target/release/bench-state-transition --realistic --single-n=$N`(baseline は `--realistic` を外す)、各実行前に cooldown。SVG は `python3 scripts/plot_realism_clean.py`(実測 ns をスクリプトに直接埋め込み)。
+- **spec 上限 V=4096 で 41.96 ms、🟢 green**(SLO target 200 ms の ~1/5)。実データ形状でも 1 スロット ~4 s に対し余裕。scaling は V に概ね線形〜やや超線形(大 V で SHA-256 HTR が支配)。
+- **絶対値はマシン熱状態に支配される**: クリーン V=4096 = 41.96 ms は、**同日**(2026-06-26)の §1c 持続負荷 realistic(43.28 ms)とほぼ一致する。より早い時刻(00:40、より冷えたマシン)では同 V が大幅に低かった(§1b は 27.55 ms)が、その後(02:33 以降〜本計測 10:00)は run / buildonly がともに一律 ~1.48× 遅い(run 112 ms vs 75.68 ms、buildonly 70 ms vs 48 ms)= クロックが下がった状態が続いた。つまり §1c 上段の 45 ms と §1b の 27.55 ms の差は「持続負荷の熱ダレ」ではなく**計測時刻 = マシン熱状態の差**であり、単独プロセス隔離だけでは低い絶対値は再現しない(電力設定は計測時すでに最大: performance gov / EPP=performance / boost / 5.26 GHz 未制限)。
+- **3 プロセスのばらつきは小さい**(V=4096: 41.90–43.89 ms。ラウンド進行で上昇トレンドなし ⇒ 残留熱の人工物ではない安定 steady-state)。
+- **含意**: STF の絶対 µs/ms はセッション間のマシン熱状態に敏感なので、**横断の絶対比較は同一セッション内**で取った値どうしで行うこと。絶対の水準は当日のマシン状態に読み替える。
+- **再現**: `cargo build --release --bin bench-state-transition` 後、各 V を別プロセスで `rust-ffi/target/release/bench-state-transition --realistic --single-n=$N`、各実行前に cooldown。SVG は `python3 scripts/plot_realism_clean.py`(実測 ns をスクリプトに直接埋め込み)。
 
 ## 2. `compute_lmd_ghost_head` (Aeneas direct, no fast path)
 

@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Generate docs/assets/bench-realism-clean.svg — STF processing time vs validators,
-measured under clean single-process isolation.
+measured under clean single-process isolation on the real-data-shaped fixture.
 
-Unlike plot_realism_abs.py (whose data comes from the sustained-load
-`bench-state-transition-realism` binary that interleaves both fixtures with a
-per-cell calibrate, keeping the CPU under continuous load), this chart's data
-comes from the §1b clean harness `bench-state-transition` run once per (V,fixture)
-in its OWN process (`--single-n=N`, `--realistic` to select the fixture), with a
+This is the §1b clean harness `bench-state-transition` run once per V in its OWN
+process (`--single-n=N`, `--realistic` to select the real-data fixture), with a
 cooldown before every process so the boost clock is not depressed by sustained
-load. Both fixture families go through the identical harness, so the two curves
-are directly comparable.
+load. Unlike plot_realism_abs.py (whose data comes from the sustained-load
+`bench-state-transition-realism` binary that keeps the CPU under continuous
+load), each cell here is thermally isolated.
+
+The plotted curve is the realistic fixture (scattered aggregation bits +
+high-entropy roots — the data shape that represents real attestations); it is the
+canonical clean STF cost. The synthetic foil fixture was measured through the
+same harness only to confirm the data shape does not change the cost (see §1c A/B
+in docs/rust-ffi-benchmarks.md); its raw numbers are kept in RUNS for provenance
+but are not plotted.
 
 The pipeline time is the paired delta run − buildonly median, i.e. the
 state_transition cost with its fixture-construction overhead cancelled out.
@@ -31,8 +36,9 @@ matplotlib.use("Agg")
 matplotlib.rcParams["svg.fonttype"] = "none"
 import matplotlib.pyplot as plt
 
-# (V, baseline_ns, variant_ns) per round — verbatim pipeline Δ from the clean
+# (V, foil_ns, realistic_ns) per round — verbatim pipeline Δ from the clean
 # per-process runs (run − buildonly median). 3 rounds, each cell its own process.
+# Only the realistic column is plotted; the foil column is the raw record.
 RUNS = [
     [(4, 500505, 484011), (8, 494727, 513860), (64, 1147906, 1221616),
      (512, 5770899, 6099421), (4096, 41362683, 41963933)],
@@ -46,7 +52,7 @@ VS = [4, 8, 64, 512, 4096]
 
 
 def collect(idx):
-    """Return {V: [ns across rounds]} for column idx (1=baseline, 2=variant)."""
+    """Return {V: [ns across rounds]} for column idx (2=realistic)."""
     out = {v: [] for v in VS}
     for run in RUNS:
         for row in run:
@@ -63,15 +69,12 @@ def stats_us(series):
 
 
 def main():
-    b_med, b_lo, b_hi = stats_us(collect(1))
-    r_med, r_lo, r_hi = stats_us(collect(2))
+    med, lo, hi = stats_us(collect(2))
 
     fig, ax = plt.subplots(figsize=(7.2, 4.4))
 
-    ax.errorbar(VS, b_med, yerr=[b_lo, b_hi], marker="o", capsize=3,
-                linewidth=1.6, label="baseline", color="#1f77b4")
-    ax.errorbar(VS, r_med, yerr=[r_lo, r_hi], marker="s", capsize=3,
-                linewidth=1.6, label="variant", color="#d62728")
+    ax.errorbar(VS, med, yerr=[lo, hi], marker="o", capsize=3,
+                linewidth=1.6, color="#1f77b4")
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")
@@ -82,20 +85,17 @@ def main():
     ax.set_title("state_transition processing time vs validators  (3-run median, error bars = min..max)")
     ax.grid(True, which="both", linewidth=0.4, alpha=0.5)
 
-    # Annotate the absolute STF time at each V (use the baseline curve).
+    # Annotate the absolute STF time at each V.
     for i, v in enumerate(VS):
-        t = b_med[i]
+        t = med[i]
         label = f"{t/1e3:.2f} ms" if t >= 1e3 else f"{t:.0f} µs"
         ax.annotate(label, xy=(v, t), xytext=(0, -14), textcoords="offset points",
                     ha="center", fontsize=8, color="#555555")
 
-    ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
-
     out = Path(__file__).resolve().parents[1] / "docs" / "assets" / "bench-realism-clean.svg"
     fig.savefig(out, format="svg", bbox_inches="tight")
     print(f"wrote {out}")
-    print("baseline median (µs):", {v: round(b_med[i], 1) for i, v in enumerate(VS)})
-    print("variant  median (µs):", {v: round(r_med[i], 1) for i, v in enumerate(VS)})
+    print("clean STF pipeline time (µs):", {v: round(med[i], 1) for i, v in enumerate(VS)})
 
 
 if __name__ == "__main__":
