@@ -215,59 +215,12 @@ private def buildBenchValidators (n : Nat) : alloc.vec.Vec types.Validator :=
     have hbits : Std.UScalarTy.U64.cNumBits = 64 := rfl
     rw [hbits]; omega)
 
-private def buildBenchState (n : UInt64) : types.State :=
-  let zeroCp : types.Checkpoint := { root := types.H256.ZERO, slot := 0#u64 }
-  let zeroHeader : types.BlockHeader :=
-    { slot := 0#u64
-      proposer_index := 0#u64
-      parent_root := types.H256.ZERO
-      state_root := types.H256.ZERO
-      body_root := types.H256.ZERO }
-  { config := { genesis_time := 0#u64 }
-    slot := 0#u64
-    latest_block_header := zeroHeader
-    latest_justified := zeroCp
-    latest_finalized := zeroCp
-    historical_block_hashes := alloc.vec.Vec.new types.H256
-    justified_slots := alloc.vec.Vec.new Bool
-    validators := buildBenchValidators n.toNat
-    justifications_roots := alloc.vec.Vec.new types.H256
-    justifications_validators := alloc.vec.Vec.new Bool }
-
-private def buildBenchBlock (n : UInt64) : types.Block :=
-  -- Block at slot 1, proposer = 1 % N (round-robin over the validator set).
-  let proposerRaw : UInt64 := if n = 0 then 0 else 1 % n
-  { slot := 1#u64
-    proposer_index := u64OfUInt64 proposerRaw
-    parent_root := types.H256.ZERO
-    state_root := types.H256.ZERO
-    body := { attestations := alloc.vec.Vec.new types.AggregatedAttestation } }
-
-/-- Build the State + Block for the requested N and run the fast pipeline. -/
-@[export csf_bench_state_transition_run]
-def csfBenchStateTransitionRun
-    (n : UInt64) (_a _seed : UInt64) : UInt8 :=
-  let state := buildBenchState n
-  let block := buildBenchBlock n
-  packStatePipeline
-    (ConsensusLean4.FastPath.stateTransitionFast state block)
-
 -- DCE escape hatches. `@[noinline]` forces the call to remain in the
 -- emitted IR; XOR'ing the results back into the return value blocks Lean's
 -- dead-code elimination from dropping the build entirely (without these
 -- the buildonly twin runs in ~1 ns and the paired-delta becomes useless).
 @[noinline] private def consumeState (_s : types.State) : UInt8 := 0
 @[noinline] private def consumeBlock (_b : types.Block) : UInt8 := 0
-
-/-- Twin: builds the same State + Block but skips the pipeline. The Rust
-harness subtracts this from the run timing to isolate pipeline cost from
-construction cost (paired-delta). -/
-@[export csf_bench_state_transition_buildonly]
-def csfBenchStateTransitionBuildOnly
-    (n : UInt64) (_a _seed : UInt64) : UInt8 :=
-  let state := buildBenchState n
-  let block := buildBenchBlock n
-  consumeState state ^^^ consumeBlock block
 
 /-! ## Fork-choice bench fixtures. -/
 
@@ -335,112 +288,9 @@ def csfBenchComputeLmdGhostHeadBuildOnly
   let atts := buildForkChoiceAttestations b a
   consumeBlocksVec blocks ^^^ consumeAttsVec atts
 
-/-! ## M5b — spec-realistic attestation workload (A = MAX_ATTESTATIONS_DATA = 8).
-
-The §1 `csf_bench_state_transition_*` fixture runs a block with **zero**
-attestations, so `processAttestationsFast`'s O(A·V) hot loop never executes — it
-measures only validator-Vec construction, not the STF body. This fixture loads
-the block with the leanSpec maximum of 8 distinct, *valid* AggregatedAttestations
-so the fast path actually runs.
-
-The genesis is reverse-engineered from `is_valid_vote` / `slot_is_justifiable_after`
-/ `current_proposer` (Funs/StateTransition.lean) so all 8 votes pass `voteIsValid`
-and stay under the 2/3 finalize threshold (which would otherwise bail to the
-Aeneas slow path and measure the wrong thing):
-  * finalized slot F = 0; source = (slot 0, historical[0]); slot 0 ≤ F ⇒ justified.
-  * 8 targets at slots {1,2,3,4,5,6,9,12}: each > F and `slot_is_justifiable_after`
-    (1–5 are ≤ 5, 6/12 are pronic, 9 is a perfect square); `justified_slots`
-    starts empty ⇒ every target slot is unjustified.
-  * historical[i] = hashOfNat i (non-zero, distinct) ⇒ `checkpoint_exists` holds
-    for both source and every target.
-  * each `aggregation_bits` sets ⌈V/2⌉ of V bits: yes = ⌈V/2⌉ < 2/3·V ⇒ no bail,
-    yet the inner loop still scans all V bits (the O(8·V) cost we want to measure).
-  * block at slot 13 with `latest_block_header.slot` = 12 ⇒ `num_empty_slots` = 0,
-    so `process_block_header` appends exactly one (ZERO) historical entry and the
-    pre-seeded indices 0..12 stay intact. -/
-
+-- 8 justifiable target slots for the A=8 valid-vote fixture below (each > the
+-- finalized slot 0 and `slot_is_justifiable_after`: 1–5 ≤ 5, 6/12 pronic, 9 square).
 private def attTargetSlots : List Nat := [1, 2, 3, 4, 5, 6, 9, 12]
-
-private def buildAttHistorical : alloc.vec.Vec types.H256 :=
-  buildVecFromList ((List.range 13).map hashOfNat) (alloc.vec.Vec.new types.H256)
-
-private def buildAttBits (n : Nat) : alloc.vec.Vec Bool :=
-  let half := (n + 1) / 2
-  buildVecFromList (List.replicate half true ++ List.replicate (n - half) false)
-    (alloc.vec.Vec.new Bool)
-
-private def buildAttestation (n : Nat) (t : Nat) : types.AggregatedAttestation :=
-  let source : types.Checkpoint := { root := hashOfNat 0, slot := 0#u64 }
-  let target : types.Checkpoint :=
-    { root := hashOfNat t, slot := u64OfUInt64 (UInt64.ofNat t) }
-  { aggregation_bits := buildAttBits n
-    data := { slot := target.slot, head := target, target := target, source := source } }
-
-private def buildAttAttestations (n : Nat) :
-    alloc.vec.Vec types.AggregatedAttestation :=
-  buildVecFromList (attTargetSlots.map (buildAttestation n))
-    (alloc.vec.Vec.new types.AggregatedAttestation)
-
-private def buildBenchStateAtt (n : UInt64) : types.State :=
-  let finalizedCp : types.Checkpoint := { root := hashOfNat 0, slot := 0#u64 }
-  let header12 : types.BlockHeader :=
-    { slot := 12#u64
-      proposer_index := 0#u64
-      parent_root := types.H256.ZERO
-      state_root := types.H256.ZERO
-      body_root := types.H256.ZERO }
-  { config := { genesis_time := 0#u64 }
-    slot := 12#u64
-    latest_block_header := header12
-    latest_justified := finalizedCp
-    latest_finalized := finalizedCp
-    historical_block_hashes := buildAttHistorical
-    justified_slots := alloc.vec.Vec.new Bool
-    validators := buildBenchValidators n.toNat
-    justifications_roots := alloc.vec.Vec.new types.H256
-    justifications_validators := alloc.vec.Vec.new Bool }
-
-private def buildBenchBlockAtt (n : UInt64) : types.Block :=
-  -- Proposer for slot 13 = 13 % V (current_proposer = slot % num_validators).
-  -- parent_root / state_root are placeholders; mkConsistentBlock fills the real
-  -- SSZ roots so the now-live hash_tree_root checks pass.
-  let proposerRaw : UInt64 := if n = 0 then 0 else 13 % n
-  { slot := 13#u64
-    proposer_index := u64OfUInt64 proposerRaw
-    parent_root := types.H256.ZERO
-    state_root := types.H256.ZERO
-    body := { attestations := buildAttAttestations n.toNat } }
-
-/-- Build the V-validator genesis + 8-valid-vote block (with consistent SSZ roots)
-and run the fast pipeline — now including real `hash_tree_root` (SHA-256). The
-`_a` slot is the fixed spec attestation count (8), baked into `attTargetSlots`;
-kept in the signature so the Rust harness plumbing stays uniform. -/
-@[export csf_bench_state_transition_att_run]
-def csfBenchStateTransitionAttRun (n _a _seed : UInt64) : UInt8 :=
-  let state := buildBenchStateAtt n
-  let block := mkConsistentBlock state (buildBenchBlockAtt n)  -- prep (cancels in Δ)
-  packStatePipeline (ConsensusLean4.FastPath.stateTransitionFast state block)
-
-/-- Paired-delta twin: run the identical prep (state build + mkConsistentBlock,
-which itself runs one pipeline) but skip the *measured* pipeline. Δ = run −
-buildonly isolates exactly one real-HTR state transition. -/
-@[export csf_bench_state_transition_att_buildonly]
-def csfBenchStateTransitionAttBuildOnly (n _a _seed : UInt64) : UInt8 :=
-  let state := buildBenchStateAtt n
-  let block := mkConsistentBlock state (buildBenchBlockAtt n)
-  consumeState state ^^^ consumeBlock block
-
-/-- Verification probe: `justifications_roots` length after the pipeline. With all
-8 votes processed (none skipped, no 2/3 bail) the serialiser prepends a ZERO
-sentinel root ⇒ length 9. The Rust harness asserts this before timing so a broken
-fixture (skipped votes, or a root-mismatch early-out) can't be measured as fast. -/
-@[export csf_bench_state_transition_att_cells]
-def csfBenchStateTransitionAttCells (n : UInt64) : UInt8 :=
-  let state := buildBenchStateAtt n
-  let block := mkConsistentBlock state (buildBenchBlockAtt n)
-  match ConsensusLean4.FastPath.stateTransitionFast state block with
-  | .ok (_, s) => (min s.justifications_roots.val.length 255).toUInt8
-  | _          => 0
 
 /-! ## M6 — FFI marshalling cost.
 
@@ -613,24 +463,38 @@ def csfBenchStateTransitionSszDecode (data : ByteArray) : UInt8 :=
   let (block, _) := decodeBlock data o
   consumeState state ^^^ consumeBlock block
 
-/-! ## Realism probe — scattered aggregation bits + high-entropy roots.
+/-! ## A = 8 valid-vote state_transition fixture (realistic attestation data).
 
-The M5b `*_att_*` fixture sets a *contiguous* ⌈V/2⌉-bit prefix and fills every
-H256 with a single repeated byte. Both make the STF cheaper to *measure* than
-real data would be: the regular bit prefix is near-ideal for the CPU branch
-predictor, and single-byte roots diverge at byte 0 so `H256` comparisons
-short-circuit immediately. This section rebuilds the identical workload (same V,
-same 8 valid votes, same no-bail / `cells = 9` invariant) but
+This is the canonical STF bench fixture. It loads a block with the leanSpec
+maximum of 8 distinct, *valid* AggregatedAttestations so `processAttestationsFast`'s
+O(A·V) hot loop actually runs (an empty block would measure only validator-Vec
+construction).
 
-  * scatters the ⌈V/2⌉ set bits with a fixed Fisher-Yates permutation
-    (`mix64` PRNG) so the inner `aggregation_bits` scan is unpredictable, and
-  * fills every H256 with a high-entropy `mix64`-derived byte pattern
-    (`hashOfNatHE`) — non-zero and injective over the historical index.
+The genesis is reverse-engineered from `is_valid_vote` / `slot_is_justifiable_after`
+/ `current_proposer` (Funs/StateTransition.lean) so all 8 votes pass `voteIsValid`
+and stay under the 2/3 finalize threshold (which would otherwise bail to the Aeneas
+slow path and measure the wrong thing):
+  * finalized slot F = 0; source = (slot 0, historical[0]); slot 0 ≤ F ⇒ justified.
+  * 8 targets at `attTargetSlots` {1,2,3,4,5,6,9,12}: each > F and justifiable;
+    `justified_slots` starts empty ⇒ every target slot is unjustified.
+  * historical[i] = hashOfNatHE i (non-zero, distinct) ⇒ `checkpoint_exists` holds
+    for both source and every target.
+  * each `aggregation_bits` sets ⌈V/2⌉ of V bits: yes = ⌈V/2⌉ < 2/3·V ⇒ no bail,
+    yet the inner loop still scans all V bits (the O(8·V) cost we measure).
+  * block at slot 13 with `latest_block_header.slot` = 12 ⇒ `num_empty_slots` = 0,
+    so `process_block_header` appends exactly one (ZERO) historical entry and the
+    pre-seeded indices 0..12 stay intact.
 
+The attestation data takes the shape real attestations have, so the measured STF
+time is not optimistically cheap:
+  * `aggregation_bits` scatters the ⌈V/2⌉ set bits with a fixed Fisher-Yates
+    permutation (`mix64` PRNG) so the inner scan is unpredictable to the branch
+    predictor (a contiguous prefix would predict near-perfectly), and
+  * every H256 root is a high-entropy `mix64`-derived byte pattern (`hashOfNatHE`,
+    non-zero and injective over the historical index) so `H256` comparisons do not
+    short-circuit at byte 0 (single-repeated-byte roots would).
 The vote count stays exactly ⌈V/2⌉ (< 2/3·V for V ≥ 4) so the fast path is
-preserved and `_real_cells` still returns 9. Measuring this against the M5b
-baseline isolates the data-pattern (branch-prediction + comparison) component
-of the timing — the "optimistic bias" of the synthetic fixture. -/
+preserved and `_cells` returns 9. -/
 
 /-- splitmix64 finalizer — deterministic 64-bit avalanche mix. -/
 @[inline] private def mix64 (x : UInt64) : UInt64 :=
@@ -716,8 +580,10 @@ private def buildBenchBlockAttReal (n : UInt64) : types.Block :=
     state_root := types.H256.ZERO
     body := { attestations := buildAttAttestationsReal n.toNat } }
 
-/-- Realistic counterpart to `csf_bench_state_transition_att_run`: scattered
-bits + high-entropy roots, otherwise identical. -/
+/-- Build the V-validator genesis + 8-valid-vote block (consistent SSZ roots, real
+`hash_tree_root` over SHA-256) and run the fast pipeline. The `_a`/`_seed` args are
+unused — A is fixed at 8 (baked into `attTargetSlots`) — but kept in the signature
+so the Rust harness plumbing stays uniform. -/
 @[export csf_bench_state_transition_att_real_run]
 def csfBenchStateTransitionAttRealRun (n _a _seed : UInt64) : UInt8 :=
   let state := buildBenchStateAttReal n

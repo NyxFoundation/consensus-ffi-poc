@@ -5,10 +5,11 @@
 // ByteArray (csf_make_bytearray), decoded into the typed `State`/`Block`
 // (ConsensusLean4/Ffi.lean M7), and fed to the pure `stateTransitionFast`.
 //
-// The fixture matches §1's buildBenchState(n)/buildBenchBlock(n) byte-for-byte
-// (N validators, empty justification/attestation vectors, block at slot 1,
-// proposer 1%N), so the decoded input is identical to the scalar-built one and
-// the STF cost is directly comparable. Correctness gate: ssz_run must return
+// The fixture is a deliberately light empty-block (A=0) State+Block: N validators,
+// empty justification/attestation vectors, block at slot 1, proposer 1%N. It is
+// written straight into the flat buffer here, and the decoder reconstructs the
+// same typed State/Block, so the STF cost is directly comparable across the
+// decode/run pair. Correctness gate: ssz_run must return
 // sentinel 0 (Ok) — a wrong codec would yield a different sentinel or crash.
 //
 // Decomposition per N (each call = make_bytearray + one export):
@@ -64,7 +65,7 @@ fn push_zeros(b: &mut Vec<u8>, n: usize) {
     b.resize(b.len() + n, 0);
 }
 
-/// Serialize State++Block matching buildBenchState(n)/buildBenchBlock(n).
+/// Serialize the empty-block (A=0) State++Block fixture into the flat codec.
 fn serialize_fixture(n: u64) -> Vec<u8> {
     let mut b = Vec::new();
     // --- State ---
@@ -194,7 +195,7 @@ fn main() {
 
     println!("# End-to-end SSZ-bytes pipeline: marshal → decode → pure STF");
     println!();
-    println!("Fixture = empty-block buildBenchState(n)/buildBenchBlock(n), serialized (flat codec, not canonical SSZ).");
+    println!("Fixture = empty-block (A=0) State+Block, serialized (flat codec, not canonical SSZ).");
     println!("hash_tree_root is now live (SHA-256): the ZERO-root flat fixture bails at the parent-root check");
     println!("(sentinel 1, InvalidParent), so STF = decode + process_slots htr(state). marshal/decode are the subject.");
     println!();
