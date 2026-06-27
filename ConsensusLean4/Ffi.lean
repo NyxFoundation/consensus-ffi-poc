@@ -20,7 +20,7 @@
 -- Block on the Lean side; bench harnesses call them once per iteration
 -- before starting the timer, so marshal cost is excluded from the
 -- pipeline measurement just like the original plan intended.
-import ConsensusLean4.FastPath
+import ConsensusLean4.StateTransition
 import ConsensusLean4.Funs
 import ConsensusLean4.Types
 import ConsensusLean4.Sha
@@ -62,39 +62,10 @@ private def mkConsistentBlock (state : types.State) (blk0 : types.Block) : types
         state_root := ConsensusLean4.Merkle.hashTreeRootState state }
   let parentRoot := ConsensusLean4.Merkle.hashTreeRootBlockHeader advancedHeader
   let blk1 := { blk0 with parent_root := parentRoot, state_root := types.H256.ZERO }
-  match ConsensusLean4.FastPath.stateTransitionFast state blk1 with
+  match ConsensusLean4.StateTransition.stateTransition state blk1 with
   | .ok (_, s2) => { blk1 with state_root := ConsensusLean4.Merkle.hashTreeRootState s2 }
   | .fail _     => blk1  -- unreachable for these fixtures
   | .div        => blk1
-
-/-- Run the handwritten Array-backed pipeline and pack the result. -/
-@[export csf_state_transition]
-def csfStateTransition (state : types.State) (block : types.Block) : UInt8 :=
-  packStatePipeline (ConsensusLean4.FastPath.stateTransitionFast state block)
-
-/-- Twin for paired-delta. Inputs are still consumed by Lean's runtime so the
-boundary cost (dec_ref of the State/Block trees) is captured here too. -/
-@[export csf_state_transition_noop]
-def csfStateTransitionNoop (_state : types.State) (_block : types.Block) :
-    UInt8 := 0
-
-/-- Direct passthrough to the Aeneas-generated fork choice (linear in attestations,
-quadratic in blocks). N (validators) does not appear in this signature. -/
-@[export csf_compute_lmd_ghost_head]
-def csfComputeLmdGhostHead
-    (start_root : types.H256)
-    (blocks : alloc.vec.Vec (types.H256 × (Std.U64 × types.H256)))
-    (attestations : alloc.vec.Vec (Std.U64 × types.AttestationData))
-    (min_score : Std.U64) : UInt8 :=
-  packForkChoice
-    (fork_choice.compute_lmd_ghost_head start_root blocks attestations min_score)
-
-@[export csf_compute_lmd_ghost_head_noop]
-def csfComputeLmdGhostHeadNoop
-    (_start_root : types.H256)
-    (_blocks : alloc.vec.Vec (types.H256 × (Std.U64 × types.H256)))
-    (_attestations : alloc.vec.Vec (Std.U64 × types.AttestationData))
-    (_min_score : Std.U64) : UInt8 := 0
 
 /-! ## Lean-side smoke fixtures
 
@@ -154,14 +125,14 @@ gets consistent SSZ roots (real hash_tree_root is live) so it is accepted. -/
 @[export csf_smoke_state_transition_ok]
 def csfSmokeStateTransitionOk (_seed : UInt64) : UInt8 :=
   packStatePipeline
-    (ConsensusLean4.FastPath.stateTransitionFast smokeGenesisState
+    (ConsensusLean4.StateTransition.stateTransition smokeGenesisState
       (mkConsistentBlock smokeGenesisState smokeBlockAtSlot1))
 
 /-- Smoke entry: same state, broken block.slot → domain error sentinel 1. -/
 @[export csf_smoke_state_transition_err]
 def csfSmokeStateTransitionErr (_seed : UInt64) : UInt8 :=
   packStatePipeline
-    (ConsensusLean4.FastPath.stateTransitionFast smokeGenesisState smokeBlockBadSlot)
+    (ConsensusLean4.StateTransition.stateTransition smokeGenesisState smokeBlockBadSlot)
 
 /-- Smoke entry for fork choice: empty blocks → fall through to (start_root, []). -/
 @[export csf_smoke_compute_lmd_ghost_head_empty]
@@ -182,7 +153,7 @@ marshal layer is needed.
 
 For state_transition we keep the workload simple: V (= n) validators with
 empty justification roots and no attestations on the block. The N axis
-shows up linearly in `processAttestationsFast`'s `collapseJustifications`
+shows up linearly in `processAttestations`'s `collapseJustifications`
 (allocates / writes the `R*V` flat bool vector even when R == 0 → V
 zeroes seeded by the ZERO sentinel root) plus the `validators` Vec
 construction itself. Attestation-rich workloads need a richer fixture
@@ -320,7 +291,7 @@ def csfBenchMarshalNoop (_data : ByteArray) : UInt8 := 0
 
 This wires the full SSZ-bytes path (issue #4) the M6 marshal bench left
 disconnected: a `ByteArray` is decoded into the typed `State` / `Block` and
-fed to the pure `stateTransitionFast`. The byte layout is a simple flat,
+fed to the pure `stateTransition`. The byte layout is a simple flat,
 length-prefixed binary codec (NOT canonical SSZ) defined to round-trip with
 the Rust serializer in `bench-ffi-ssz.rs`; it covers every field of `State`
 and `Block`. No `hash_tree_root`/SHA is involved — decoding is pure layout.
@@ -453,7 +424,7 @@ state transition. `data` is consumed (dec_ref). -/
 def csfBenchStateTransitionSszRun (data : ByteArray) : UInt8 :=
   let (state, o) := decodeState data 0
   let (block, _) := decodeBlock data o
-  packStatePipeline (ConsensusLean4.FastPath.stateTransitionFast state block)
+  packStatePipeline (ConsensusLean4.StateTransition.stateTransition state block)
 
 /-- Twin: decode only, skip the pipeline. Paired-delta isolates decode cost
 (`_ssz_run` − `_ssz_decode` = pure STF; `_ssz_decode` − marshal = decode). -/
@@ -466,7 +437,7 @@ def csfBenchStateTransitionSszDecode (data : ByteArray) : UInt8 :=
 /-! ## A = 8 valid-vote state_transition fixture (realistic attestation data).
 
 This is the canonical STF bench fixture. It loads a block with the leanSpec
-maximum of 8 distinct, *valid* AggregatedAttestations so `processAttestationsFast`'s
+maximum of 8 distinct, *valid* AggregatedAttestations so `processAttestations`'s
 O(A·V) hot loop actually runs (an empty block would measure only validator-Vec
 construction).
 
@@ -588,7 +559,7 @@ so the Rust harness plumbing stays uniform. -/
 def csfBenchStateTransitionAttRealRun (n _a _seed : UInt64) : UInt8 :=
   let state := buildBenchStateAttReal n
   let block := mkConsistentBlock state (buildBenchBlockAttReal n)
-  packStatePipeline (ConsensusLean4.FastPath.stateTransitionFast state block)
+  packStatePipeline (ConsensusLean4.StateTransition.stateTransition state block)
 
 @[export csf_bench_state_transition_att_real_buildonly]
 def csfBenchStateTransitionAttRealBuildOnly (n _a _seed : UInt64) : UInt8 :=
@@ -600,6 +571,6 @@ def csfBenchStateTransitionAttRealBuildOnly (n _a _seed : UInt64) : UInt8 :=
 def csfBenchStateTransitionAttRealCells (n : UInt64) : UInt8 :=
   let state := buildBenchStateAttReal n
   let block := mkConsistentBlock state (buildBenchBlockAttReal n)
-  match ConsensusLean4.FastPath.stateTransitionFast state block with
+  match ConsensusLean4.StateTransition.stateTransition state block with
   | .ok (_, s) => (min s.justifications_roots.val.length 255).toUInt8
   | _          => 0

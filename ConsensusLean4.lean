@@ -5,5 +5,5 @@ import ConsensusLean4.FunsExternal
 import ConsensusLean4.Funs
 import ConsensusLean4.Sha
 import ConsensusLean4.Merkleization
-import ConsensusLean4.FastPath
+import ConsensusLean4.StateTransition
 import ConsensusLean4.Ffi

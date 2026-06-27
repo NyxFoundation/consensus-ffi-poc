@@ -3,7 +3,7 @@
 // Connects what M6 (bench-ffi-marshal) left split: a State+Block is serialized
 // on the Rust side to a flat length-prefixed buffer, marshalled into a Lean
 // ByteArray (csf_make_bytearray), decoded into the typed `State`/`Block`
-// (ConsensusLean4/Ffi.lean M7), and fed to the pure `stateTransitionFast`.
+// (ConsensusLean4/Ffi.lean M7), and fed to the pure `stateTransition`.
 //
 // The fixture is a deliberately light empty-block (A=0) State+Block: N validators,
 // empty justification/attestation vectors, block at slot 1, proposer 1%N. It is
@@ -219,7 +219,7 @@ fn main() {
     println!();
     println!(
         "> marshal = alloc+memcpy+dec_ref; decode = ssz_decode−marshal (bytes→typed State/Block); \
-         STF = ssz_run−ssz_decode (stateTransitionFast; bails at parent-root htr for this flat fixture). \
+         STF = ssz_run−ssz_decode (stateTransition; bails at parent-root htr for this flat fixture). \
          Trials={TRIALS}. Flat codec (not canonical SSZ); hash_tree_root itself is real SHA-256."
     );
 }

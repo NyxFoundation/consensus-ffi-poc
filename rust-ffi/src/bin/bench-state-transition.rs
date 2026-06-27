@@ -3,7 +3,7 @@
 // Drives `csf_bench_state_transition_att_real_run` and its `_buildonly`
 // paired-delta twin. The block carries A = MAX_ATTESTATIONS_DATA = 8 *valid*
 // attestations (scattered aggregation bits + high-entropy roots = real
-// attestation data shape) so the O(A·V) fast path (processAttestationsFast)
+// attestation data shape) so the O(A·V) attestation path (processAttestations)
 // actually runs. Builders live entirely on the Lean side (cf.
 // ConsensusLean4/Ffi.lean) so the harness only passes primitive `u64` arguments.
 //
