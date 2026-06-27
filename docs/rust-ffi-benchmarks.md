@@ -1,6 +1,6 @@
 ---
 title: Rust ↔ Lean 4 FFI ベンチマーク 実測結果
-last_updated: 2026-06-26
+last_updated: 2026-06-27
 tags:
   - benchmark
   - ffi
@@ -36,7 +36,7 @@ tags:
 
 1. **`hash_tree_root` は実 SHA-256 で計算される** (issue #5, §1b): 旧 ZERO スタブを廃し、`ConsensusLean4.Merkle`(純 Lean SSZ merkleize)＋ Rust `@[extern]` の SHA-256(sha2 crate)で本物の root を計算する。step4 の state_root 照合と `process_block_header` の parent_root 照合は live。**ただし署名検証(XMSS)は依然 STF 外で未計測**(§4e)。
 2. **Bench fixture は spec 標準ワークロード**:
-   - `state_transition`: V validators の State + **A = `MAX_ATTESTATIONS_DATA` = 8 個の有効 AggregatedAttestation** を載せた Block。`processAttestationsFast` の `O(A·V)` ホットループが実際に走る (§1)。8 票はすべて `voteIsValid` を通り、かつ 2/3 finalize 閾値未満を維持 (fast path 継続)。**旧版は A=0 の空ブロックで構築コストのみを測っていた**ため、本再測で STF 本体に置き換えた。
+   - `state_transition`: V validators の State + **A = `MAX_ATTESTATIONS_DATA` = 8 個の有効 AggregatedAttestation** を載せた Block。`processAttestations` の `O(A·V)` ホットループが実際に走る (§1)。8 票はすべて `voteIsValid` を通り、かつ 2/3 finalize 閾値未満を維持 (fast path 継続)。**旧版は A=0 の空ブロックで構築コストのみを測っていた**ため、本再測で STF 本体に置き換えた。
    - `compute_lmd_ghost_head`: 線形チェーン B blocks + A attestations が最終 block にすべて投票。`alloc.vec.Vec` が `List`-backed のため、内部の block index は `List.indexOf` ベースで O(B)。**V 軸を持たない** (B blocks / A attestations でスケール、B ≤ `HISTORICAL_ROOTS_LIMIT = 2^18`) ため V 上限の修正対象外で、本再測では §2 の旧値を据え置く。
 3. **paired-delta** はビルド構築コストを差し引く (`@[noinline] consumeState/consumeBlock` で Lean の DCE を抑止して buildonly twin が実際にビルド工程を踏むことを保証)。
 
@@ -60,7 +60,7 @@ leanSpec `main@cb862c0` (2026-06-24), `src/lean_spec/spec/forks/lstar/`:
 
 ## 1. `state_transition` (handwritten Array fast path, spec-realistic A=8)
 
-軸: **V (validators) ∈ {4, 8, 64, 512, 4096}** = leanSpec の許容範囲 (V ≤ `VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096`、§0 spec 定数表)。ブロックは **A = `MAX_ATTESTATIONS_DATA` = 8 個の有効 AggregatedAttestation** を載せ、`processAttestationsFast` の `O(A·V)` ホットループを**実際に走らせる**。旧版は空ブロック (A=0) で `collapseJustifications` の構築コストのみを測っており STF 本体を踏んでいなかった (前提 §2)。
+軸: **V (validators) ∈ {4, 8, 64, 512, 4096}** = leanSpec の許容範囲 (V ≤ `VALIDATOR_REGISTRY_LIMIT = 2^12 = 4096`、§0 spec 定数表)。ブロックは **A = `MAX_ATTESTATIONS_DATA` = 8 個の有効 AggregatedAttestation** を載せ、`processAttestations` の `O(A·V)` ホットループを**実際に走らせる**。旧版は空ブロック (A=0) で `collapseJustifications` の構築コストのみを測っており STF 本体を踏んでいなかった (前提 §2)。
 
 fixture は `is_valid_vote` / `slot_is_justifiable_after` / `current_proposer` (`Funs/StateTransition.lean`) から逆算した genesis: finalized slot 0、source = (slot 0, `historical[0]`)、target slots {1,2,3,4,5,6,9,12} (すべて justifiable: 1–5 ≤ 5 / 6,12 pronic / 9 平方数)、各 attestation は ⌈V/2⌉ ビットを投票し 2/3 閾値未満を維持 → fast path 継続 (2/3 到達なら Aeneas slow path に bail し別物を測ってしまう)。**Rust harness は計測前に `csf_bench_state_transition_att_real_cells(64) == 9` を assert** — pipeline 後の `justifications_roots` 長 = zero sentinel + 8 distinct target roots = 9。8 票が確かに有効処理された証拠で、票が skip/bail されると ≠9 で abort し「速いが無意味」な数値を記録させない。
 
@@ -244,7 +244,7 @@ A axis scaling check (B=100 fixed):
 
 ## 3. 主な観察
 
-1. **spec 範囲の `stateTransitionFast` (A=8) は余裕の green**: V=4096 (spec 上限) で **15 ms** ≪ target 200 ms。8 票の `O(8·V)` ホットループを実際に走らせた値で、旧空ブロック版 (構築コストのみ) の置き換え。V=512→4096 で ~linear (`O(8·V)` が支配)、小 V は 8 票分の `voteIsValid` 固定費 (~300 µs)。
+1. **spec 範囲の `stateTransition` (A=8) は余裕の green**: V=4096 (spec 上限) で **15 ms** ≪ target 200 ms。8 票の `O(8·V)` ホットループを実際に走らせた値で、旧空ブロック版 (構築コストのみ) の置き換え。V=512→4096 で ~linear (`O(8·V)` が支配)、小 V は 8 票分の `voteIsValid` 固定費 (~300 µs)。
 2. **`compute_lmd_ghost_head` は B=100 ですら SLO target 超過**: 313ms (A=32) / 1220ms (A=128) vs target 100ms。`Ffi.lean` の "quadratic in blocks" が Lean の List-backed Vec で表面化しており、A 軸は実測 4× linear に従う。**V 軸を持たず B (≤ `HISTORICAL_ROOTS_LIMIT = 2^18`) でスケール**するため今回の V 上限再測の対象外。専用 fast path (`compute_lmd_ghost_head_fast`、別 issue 候補) なしには実運用不可。
 3. **build cost (paired-delta の片側) は spec 範囲では小さい**: V=4096 で 493 µs / 15.6 ms (run の ~3%)。A=8 の STF 本体が支配的になり、`List.replicate V + Vec ⟨xs, ...⟩` の構築コストの比率は旧空ブロック版より低下。paired-delta による減算で正味 pipeline コストを抽出。
 4. **メモリ**: spec 範囲 (V ≤ 4096) は `ru_maxrss` delta 数 MB。out-of-spec の V=1M は **+584 MB** (8 本の 1M-bit aggregation + R·V=9M flat) で旧空ブロック 1M (68 MB) の ~8.6×、かつ List 再帰が 8 MB スタックを溢れさせ 2 GiB スタックスレッドを要する。**spec の V≤4096 がこの List-backed モデルを tractable に保つ**。
@@ -372,7 +372,7 @@ target/release/bench-ffi-marshal
 
 ## 4d. End-to-end SSZ-bytes パイプライン 追測 (2026-06-04)
 
-§4b/§4c は「①marshal」だけを測り、「②decode → ③純粋関数」が未接続だった。本節でその全経路を繋いだ ——`ByteArray` を**型付き `State`/`Block` にデコードし、純粋 `stateTransitionFast` に渡す**。`bench-ffi-ssz` (`rust-ffi/src/bin/bench-ffi-ssz.rs`) + `ConsensusLean4/Ffi.lean` M7。
+§4b/§4c は「①marshal」だけを測り、「②decode → ③純粋関数」が未接続だった。本節でその全経路を繋いだ ——`ByteArray` を**型付き `State`/`Block` にデコードし、純粋 `stateTransition` に渡す**。`bench-ffi-ssz` (`rust-ffi/src/bin/bench-ffi-ssz.rs`) + `ConsensusLean4/Ffi.lean` M7。
 
 - **コーデック**: フラットな length-prefixed バイナリ (正準 SSZ ではない) を Lean decode (`decodeState`/`decodeBlock`) と Rust serializer (`serialize_fixture`) で round-trip。`State`/`Block` の全フィールドを網羅。**`hash_tree_root`/SHA は不使用** (decode は純粋なバイト配置)。
 - **fixture は空ブロック (A=0) 版**: N validator・justification/attestation ベクタ空・block は slot 1/proposer 1%N のフラットな State+Block を直接シリアライズ。**§1 の A=8 有効投票ワークロードとは別物**で、ここでの STF は構築コスト寄りの A=0 経路 (marshal/decode コストの相対比較が目的のため意図的に軽い fixture を使う)。A=8 経路の SSZ e2e は将来課題。
@@ -431,7 +431,7 @@ target/release/bench-ffi-ssz            # V = 4, 8, 64, 512, 4096 (spec range)
 
 ## 4e. STF 忠実度 — leanSpec `spec.py` 対応と realistic 化の差分
 
-計測対象の `stateTransitionFast` が leanSpec 正準 STF (`src/lean_spec/forks/lstar/spec.py` の `state_transition`, L614) のどこを実装しているかを明記する。**本ベンチの数値は "完全な STF" ではなく以下の被覆範囲に対する値**である点に注意 (= 実 STF コストの下限)。
+計測対象の `stateTransition` が leanSpec 正準 STF (`src/lean_spec/forks/lstar/spec.py` の `state_transition`, L614) のどこを実装しているかを明記する。**本ベンチの数値は "完全な STF" ではなく以下の被覆範囲に対する値**である点に注意 (= 実 STF コストの下限)。
 
 leanSpec `state_transition` (L614-647) は 4 ステップ:
 
@@ -447,9 +447,9 @@ def state_transition(state, block, valid_signatures=True):
 | leanSpec `spec.py` | consensus-ffi-poc | 状態 |
 |---|---|---|
 | 2. `process_slots` (L135) | `state_transition.process_slots` | ✅ 実装 |
-| 3. `process_block` (L332) | `processBlockFast` | ✅ 実装 |
+| 3. `process_block` (L332) | `processBlock` | ✅ 実装 |
 | ├ `process_block_header` (L195) | `state_transition.process_block_header` | ✅(内部 HTR も実 SHA-256、§1b) |
-| └ `process_attestations` (L385) | `processAttestationsFast` + `try_finalize` | ✅ 実装(§1 で A=8 有効投票を駆動) |
+| └ `process_attestations` (L385) | `processAttestations` + `try_finalize` | ✅ 実装(§1 で A=8 有効投票を駆動) |
 | 4. `hash_tree_root` 照合 (L644) | `hash_tree_root_state`→`eq`→`StateRootMismatch` | ✅ 実装。HTR は実 SSZ SHA-256(§1b) |
 | 1. `valid_signatures` 前提 (L634) | — | ❌ 引数なし(常に valid 扱い) |
 | `verify_signatures` (L864, 別メソッド) | — | ❌ 完全欠如 |
@@ -480,4 +480,4 @@ def state_transition(state, block, valid_signatures=True):
 - ~~**issue #5** (`hash_tree_root` real 実装)~~: **完了(§1b)**。実 SSZ SHA-256 HTR を STF に組み込み再測。V=4096 で 27.55 ms。残課題は署名検証(①)
 - **issue #6** (block-chaining bench): 現 fixture は genesis→1 block のみ。N block chain で連続 state を計測
 - **新規候補** (本実測から): `compute_lmd_ghost_head_fast` (Array-backed) の handwritten 実装。B=10K で 1s 切りが目標
-- **新規候補**: state_transition の "realistic attestation" fixture (R≥1 + valid checkpoints + non-trivial agg_bits) で `processAttestationsFast` の N·A scaling を計測
+- **新規候補**: state_transition の "realistic attestation" fixture (R≥1 + valid checkpoints + non-trivial agg_bits) で `processAttestations` の N·A scaling を計測

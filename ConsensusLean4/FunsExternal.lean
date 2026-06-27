@@ -2,7 +2,7 @@
 -- [ethlambda_verification]: external functions.
 -- The five `axiom` slots from the template are filled below with real Lean
 -- implementations so the consensus model is computable end-to-end. M2 of the
--- FFI plan; required before stateTransitionFast can be linked into Rust.
+-- FFI plan; required before stateTransition can be linked into Rust.
 -- `FunsExternal_Template.lean` is refreshed on every Aeneas run and remains
 -- the canonical signature reference — diff it against this file to catch
 -- upstream signature drift.
